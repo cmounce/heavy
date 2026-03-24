@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::env;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use http_body_util::{Either, Full};
 use hyper::body::{Bytes, Incoming};
@@ -9,7 +10,10 @@ use hyper::{Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
+use serde_json::{Map, Value};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
@@ -25,15 +29,40 @@ async fn main() {
         .expect("TARGET must include a host (e.g. http://localhost:3011)")
         .clone();
 
-    // Using the legacy `Client` here for connection pooling.
-    // `Incoming` streams request bodies without buffering.
+    let log_path = env::var("LOG_FILE").unwrap_or_else(|_| "heavy.jsonl".to_string());
+
+    // Open the log file in append mode and spawn a dedicated writer task
+    let log_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .await
+        .unwrap_or_else(|e| panic!("failed to open log file {log_path}: {e}"));
+    let (log_tx, mut log_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut writer = tokio::io::BufWriter::new(log_file);
+        while let Some(line) = log_rx.recv().await {
+            if let Err(e) = async {
+                writer.write_all(line.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await
+            }
+            .await
+            {
+                eprintln!("heavy: log write failed: {e}");
+            }
+        }
+    });
+
+    // Using the legacy Client for connection pooling.
+    // The Incoming type parameter streams request bodies without buffering.
     let client: Client<_, Incoming> = Client::builder(TokioExecutor::new()).build_http();
 
     let listener = TcpListener::bind(&bind)
         .await
         .unwrap_or_else(|e| panic!("failed to bind to {bind}: {e}"));
 
-    eprintln!("heavy: listening on {bind}, proxying to {target}");
+    eprintln!("heavy: listening on {bind}, proxying to {target}, logging to {log_path}");
 
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -46,16 +75,24 @@ async fn main() {
 
         let client = client.clone();
         let target_authority = target_authority.clone();
+        let log_tx = log_tx.clone();
 
-        // tokio::spawn moves the connection onto its own async task, so the accept loop immediately
-        // continues waiting for the next connection.
+        // tokio::spawn moves the connection onto its own async task, so the accept loop
+        // immediately continues waiting for the next connection.
         tokio::spawn(async move {
-            // TokioIo adapts a tokio TcpStream into the I/O traits hyper expects.
+            // TokioIo adapts a tokio TcpStream into the I/O traits hyper expects
             let io = hyper_util::rt::TokioIo::new(stream);
             if let Err(e) = ServerBuilder::new(TokioExecutor::new())
                 .serve_connection(
                     io,
-                    service_fn(|req| handle_request(req, client.clone(), target_authority.clone())),
+                    service_fn(|req| {
+                        handle_request(
+                            req,
+                            client.clone(),
+                            target_authority.clone(),
+                            log_tx.clone(),
+                        )
+                    }),
                 )
                 .await
             {
@@ -65,12 +102,18 @@ async fn main() {
     }
 }
 
-/// Proxy a single request to the target and return its response.
+/// Proxy a single request to the target, log metadata, and return the response.
 async fn handle_request(
     req: Request<Incoming>,
     client: Client<hyper_util::client::legacy::connect::HttpConnector, Incoming>,
     target_authority: hyper::http::uri::Authority,
+    log_tx: mpsc::UnboundedSender<String>,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let timestamp_secs = timestamp.as_secs() as f64 + timestamp.subsec_millis() as f64 / 1000.0;
+
     // Rewrite URI to point at the target, preserving the original path and query
     let path_and_query = req
         .uri()
@@ -84,8 +127,13 @@ async fn handle_request(
         .build()
         .unwrap();
 
-    // Build the outgoing request with filtered headers
+    // Capture request metadata for logging before we consume the request
+    let method = req.method().to_string();
+    let path = path_and_query.to_string();
     let (parts, body) = req.into_parts();
+    let request_headers = collect_header_map(&parts.headers);
+
+    // Build the outgoing request with filtered headers
     let mut outgoing = Request::builder().method(parts.method).uri(target_uri);
     for (name, value) in forward_headers(&parts.headers) {
         outgoing = outgoing.header(name, value);
@@ -93,26 +141,52 @@ async fn handle_request(
     outgoing = outgoing.header(header::HOST, target_authority.as_str());
     let outgoing = outgoing.body(body).unwrap();
 
-    // Send to the target
-    let upstream_resp = match client.request(outgoing).await {
-        Ok(resp) => resp,
+    // Send to the target and measure round-trip latency
+    let start = Instant::now();
+    let (status, resp_body) = match client.request(outgoing).await {
+        Ok(resp) => {
+            let (resp_parts, resp_body) = resp.into_parts();
+            let mut response = Response::builder().status(resp_parts.status);
+            for (name, value) in forward_headers(&resp_parts.headers) {
+                response = response.header(name, value);
+            }
+            let status = resp_parts.status.as_u16();
+            (status, response.body(Either::Left(resp_body)).unwrap())
+        }
         Err(e) => {
             eprintln!("heavy: upstream request failed: {e}");
-            return Ok(Response::builder()
+            let resp = Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Either::Right(Full::new(Bytes::from("502 Bad Gateway\n"))))
-                .unwrap());
+                .unwrap();
+            (502, resp)
         }
     };
+    let latency_ms = start.elapsed().as_millis() as u64;
 
-    // Build the response back to the client, again with filtered headers.
-    let (resp_parts, resp_body) = upstream_resp.into_parts();
-    let mut response = Response::builder().status(resp_parts.status);
-    for (name, value) in forward_headers(&resp_parts.headers) {
-        response = response.header(name, value);
+    // Send the log entry to the writer task
+    let entry = serde_json::json!({
+        "timestamp": timestamp_secs,
+        "method": method,
+        "path": path,
+        "headers": Value::Object(request_headers),
+        "status": status,
+        "latency_ms": latency_ms,
+    });
+    let _ = log_tx.send(entry.to_string());
+
+    Ok(resp_body)
+}
+
+/// Collect forwarded request headers into a JSON map for logging.
+fn collect_header_map(headers: &HeaderMap) -> Map<String, Value> {
+    let mut map = Map::new();
+    for (name, value) in forward_headers(headers) {
+        if let Ok(v) = value.to_str() {
+            map.insert(name.to_string(), Value::String(v.to_string()));
+        }
     }
-
-    Ok(response.body(Either::Left(resp_body)).unwrap())
+    map
 }
 
 /// Iterate over headers that are allowed to be forwarded through the proxy.
@@ -140,7 +214,8 @@ fn forward_headers(
         | header::TE
         | header::TRAILER
         | header::TRANSFER_ENCODING
-        | header::UPGRADE | _ if *name == "keep-alive" || connection_skip.contains(name) => false,
+        | header::UPGRADE
+        | _ if *name == "keep-alive" || connection_skip.contains(name) => false,
         _ => true,
     })
 }
