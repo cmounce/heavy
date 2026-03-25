@@ -7,7 +7,6 @@ use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderName};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
-use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use serde_json::{Map, Value};
@@ -54,10 +53,6 @@ async fn main() {
         }
     });
 
-    // Using the legacy Client for connection pooling.
-    // The Incoming type parameter streams request bodies without buffering.
-    let client: Client<_, Incoming> = Client::builder(TokioExecutor::new()).build_http();
-
     let listener = TcpListener::bind(&bind)
         .await
         .unwrap_or_else(|e| panic!("failed to bind to {bind}: {e}"));
@@ -73,7 +68,6 @@ async fn main() {
             }
         };
 
-        let client = client.clone();
         let target_authority = target_authority.clone();
         let log_tx = log_tx.clone();
 
@@ -82,17 +76,16 @@ async fn main() {
         tokio::spawn(async move {
             // TokioIo adapts a tokio TcpStream into the I/O traits hyper expects
             let io = hyper_util::rt::TokioIo::new(stream);
+
+            // Preserve capitalization of existing headers and prefer Title-Case for new ones. This
+            // addresses compatibility problems with Anubis (which expects "X-Real-Ip") and maybe
+            // with other software as well.
             if let Err(e) = ServerBuilder::new(TokioExecutor::new())
+                .preserve_header_case(true)
+                .title_case_headers(true)
                 .serve_connection(
                     io,
-                    service_fn(|req| {
-                        handle_request(
-                            req,
-                            client.clone(),
-                            target_authority.clone(),
-                            log_tx.clone(),
-                        )
-                    }),
+                    service_fn(|req| handle_request(req, target_authority.clone(), log_tx.clone())),
                 )
                 .await
             {
@@ -105,7 +98,6 @@ async fn main() {
 /// Proxy a single request to the target, log metadata, and return the response.
 async fn handle_request(
     req: Request<Incoming>,
-    client: Client<hyper_util::client::legacy::connect::HttpConnector, Incoming>,
     target_authority: hyper::http::uri::Authority,
     log_tx: mpsc::UnboundedSender<String>,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
@@ -135,19 +127,18 @@ async fn handle_request(
 
     // Build the outgoing request with filtered headers
     let mut outgoing = Request::builder().method(parts.method).uri(target_uri);
-    for (name, value) in forward_headers(&parts.headers) {
+    for (name, value) in filter_headers(&parts.headers) {
         outgoing = outgoing.header(name, value);
     }
-    outgoing = outgoing.header(header::HOST, target_authority.as_str());
     let outgoing = outgoing.body(body).unwrap();
 
     // Send to the target and measure round-trip latency
     let start = Instant::now();
-    let (status, resp_body) = match client.request(outgoing).await {
+    let (status, resp_body) = match connect_and_send(target_authority.as_str(), outgoing).await {
         Ok(resp) => {
             let (resp_parts, resp_body) = resp.into_parts();
             let mut response = Response::builder().status(resp_parts.status);
-            for (name, value) in forward_headers(&resp_parts.headers) {
+            for (name, value) in filter_headers(&resp_parts.headers) {
                 response = response.header(name, value);
             }
             let status = resp_parts.status.as_u16();
@@ -178,10 +169,34 @@ async fn handle_request(
     Ok(resp_body)
 }
 
+/// Open a TCP connection to the target and send a request with header case preservation.
+async fn connect_and_send(
+    authority: &str,
+    req: Request<Incoming>,
+) -> Result<Response<Incoming>, Box<dyn std::error::Error + Send + Sync>> {
+    let stream = tokio::net::TcpStream::connect(authority).await?;
+    let io = hyper_util::rt::TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+        .preserve_header_case(true)
+        .title_case_headers(true)
+        .handshake(io)
+        .await?;
+
+    // Drive the connection in a background task
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("heavy: upstream connection error: {e}");
+        }
+    });
+
+    Ok(sender.send_request(req).await?)
+}
+
 /// Collect forwarded request headers into a JSON map for logging.
 fn collect_header_map(headers: &HeaderMap) -> Map<String, Value> {
     let mut map = Map::new();
-    for (name, value) in forward_headers(headers) {
+    for (name, value) in filter_headers(headers) {
         if let Ok(v) = value.to_str() {
             map.insert(name.to_string(), Value::String(v.to_string()));
         }
@@ -194,7 +209,7 @@ fn collect_header_map(headers: &HeaderMap) -> Map<String, Value> {
 /// This filters out hop-by-hop headers (headers that only apply to a direct connection between two
 /// clients), including those specified by the Connection header itself. See RFC 9110 or this page
 /// for more info: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Connection
-fn forward_headers(
+fn filter_headers(
     headers: &HeaderMap,
 ) -> impl Iterator<Item = (&HeaderName, &header::HeaderValue)> {
     // Collect extra header names listed in `Connection: keep-alive, x-custom, ...`
