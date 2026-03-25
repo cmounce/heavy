@@ -110,23 +110,17 @@ async fn handle_request(
     let path_and_query = req
         .uri()
         .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let target_uri: Uri = Uri::builder()
-        .scheme("http")
-        .authority(target_authority.as_str())
-        .path_and_query(path_and_query)
-        .build()
-        .unwrap();
+        .map(|pq| pq.to_string())
+        .unwrap_or_else(|| "/".to_string());
 
     // Capture request metadata for logging before we consume the request
     let method = req.method().to_string();
-    let path = path_and_query.to_string();
+    let path = path_and_query.clone();
     let (parts, body) = req.into_parts();
     let request_headers = collect_header_map(&parts.headers);
 
     // Build the outgoing request with filtered headers
-    let mut outgoing = Request::builder().method(parts.method).uri(target_uri);
+    let mut outgoing = Request::builder().method(parts.method).uri(path_and_query);
     for (name, value) in filter_headers(&parts.headers) {
         outgoing = outgoing.header(name, value);
     }
