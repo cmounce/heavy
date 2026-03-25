@@ -117,12 +117,15 @@ async fn handle_request(
     let method = req.method().to_string();
     let path = path_and_query.clone();
     let (parts, body) = req.into_parts();
-    let request_headers = collect_header_map(&parts.headers);
 
-    // Build the outgoing request with filtered headers
+    // Build the outgoing request and collect headers for logging in one pass
     let mut outgoing = Request::builder().method(parts.method).uri(path_and_query);
+    let mut logged_headers = Map::new();
     for (name, value) in filter_headers(&parts.headers) {
         outgoing = outgoing.header(name, value);
+        if let Ok(v) = value.to_str() {
+            logged_headers.insert(name.to_string(), Value::String(v.to_string()));
+        }
     }
     let outgoing = outgoing.body(body).unwrap();
 
@@ -154,7 +157,7 @@ async fn handle_request(
         "timestamp": timestamp_secs,
         "method": method,
         "path": path,
-        "headers": Value::Object(request_headers),
+        "headers": Value::Object(logged_headers),
         "status": status,
         "latency_ms": latency_ms,
     });
@@ -187,17 +190,6 @@ async fn connect_and_send(
     Ok(sender.send_request(req).await?)
 }
 
-/// Collect forwarded request headers into a JSON map for logging.
-fn collect_header_map(headers: &HeaderMap) -> Map<String, Value> {
-    let mut map = Map::new();
-    for (name, value) in filter_headers(headers) {
-        if let Ok(v) = value.to_str() {
-            map.insert(name.to_string(), Value::String(v.to_string()));
-        }
-    }
-    map
-}
-
 /// Iterate over headers that are allowed to be forwarded through the proxy.
 ///
 /// This filters out hop-by-hop headers (headers that only apply to a direct connection between two
@@ -223,8 +215,63 @@ fn filter_headers(
         | header::TE
         | header::TRAILER
         | header::TRANSFER_ENCODING
-        | header::UPGRADE
-        | _ if *name == "keep-alive" || connection_skip.contains(name) => false,
+        | header::UPGRADE => false,
+        _ if *name == "keep-alive" || connection_skip.contains(name) => false,
         _ => true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_names(headers: &HeaderMap) -> Vec<String> {
+        let mut names: Vec<String> = filter_headers(headers)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn filters_all_hop_by_hop_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, "close".parse().unwrap());
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert(header::PROXY_AUTHENTICATE, "Basic".parse().unwrap());
+        headers.insert(header::PROXY_AUTHORIZATION, "Basic abc".parse().unwrap());
+        headers.insert(header::TE, "trailers".parse().unwrap());
+        headers.insert(header::TRAILER, "Expires".parse().unwrap());
+        headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.insert(header::UPGRADE, "websocket".parse().unwrap());
+
+        assert!(header_names(&headers).is_empty());
+    }
+
+    #[test]
+    fn mixed_hop_by_hop_and_regular() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "*/*".parse().unwrap());
+        headers.insert(header::CONNECTION, "close".parse().unwrap());
+        headers.insert(header::HOST, "localhost".parse().unwrap());
+        headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.insert(header::USER_AGENT, "curl/8.0".parse().unwrap());
+        headers.insert("x-real-ip", "127.0.0.1".parse().unwrap());
+
+        assert_eq!(
+            header_names(&headers),
+            vec!["accept", "host", "user-agent", "x-real-ip"]
+        );
+    }
+
+    #[test]
+    fn filters_connection_nominated_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, "x-foo, x-baz".parse().unwrap());
+        headers.insert("x-foo", "1".parse().unwrap());
+        headers.insert("x-bar", "2".parse().unwrap());
+        headers.insert("x-baz", "3".parse().unwrap());
+
+        assert_eq!(header_names(&headers), vec!["x-bar"]);
+    }
 }
