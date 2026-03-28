@@ -1,6 +1,11 @@
+mod latency;
+
 use std::convert::Infallible;
 use std::env;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use latency::LatencyMonitor;
 
 use http_body_util::{Either, Full};
 use hyper::body::{Bytes, Incoming};
@@ -14,29 +19,27 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+struct Config {
+    bind: String,
+    target: Uri,
+    target_authority: hyper::http::uri::Authority,
+    log_path: String,
+    latency_weight: f64,
+    latency_high_ms: f64,
+    latency_low_ms: f64,
+}
+
 #[tokio::main]
 async fn main() {
-    let bind = env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8011".to_string());
-
-    let target: Uri = env::var("TARGET")
-        .unwrap_or_else(|_| "http://localhost:3011".to_string())
-        .parse()
-        .expect("TARGET must be a valid URI (e.g. http://localhost:3011)");
-
-    let target_authority = target
-        .authority()
-        .expect("TARGET must include a host (e.g. http://localhost:3011)")
-        .clone();
-
-    let log_path = env::var("LOG_FILE").unwrap_or_else(|_| "heavy.jsonl".to_string());
+    let config = load_config();
 
     // Open the log file in append mode and spawn a dedicated writer task
     let log_file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
+        .open(&config.log_path)
         .await
-        .unwrap_or_else(|e| panic!("failed to open log file {log_path}: {e}"));
+        .unwrap_or_else(|e| panic!("failed to open log file {}: {e}", config.log_path));
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         let mut writer = tokio::io::BufWriter::new(log_file);
@@ -53,11 +56,20 @@ async fn main() {
         }
     });
 
-    let listener = TcpListener::bind(&bind)
+    let listener = TcpListener::bind(&config.bind)
         .await
-        .unwrap_or_else(|e| panic!("failed to bind to {bind}: {e}"));
+        .unwrap_or_else(|e| panic!("failed to bind to {}: {e}", config.bind));
 
-    eprintln!("heavy: listening on {bind}, proxying to {target}, logging to {log_path}");
+    let monitor = Arc::new(LatencyMonitor::new(
+        config.latency_weight,
+        config.latency_high_ms,
+        config.latency_low_ms,
+    ));
+
+    eprintln!(
+        "heavy: listening on {}, proxying to {}, logging to {}",
+        config.bind, config.target, config.log_path
+    );
 
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -68,8 +80,9 @@ async fn main() {
             }
         };
 
-        let target_authority = target_authority.clone();
+        let target_authority = config.target_authority.clone();
         let log_tx = log_tx.clone();
+        let monitor = monitor.clone();
 
         // tokio::spawn moves the connection onto its own async task, so the accept loop
         // immediately continues waiting for the next connection.
@@ -85,7 +98,14 @@ async fn main() {
                 .title_case_headers(true)
                 .serve_connection(
                     io,
-                    service_fn(|req| handle_request(req, target_authority.clone(), log_tx.clone())),
+                    service_fn(|req| {
+                        handle_request(
+                            req,
+                            target_authority.clone(),
+                            log_tx.clone(),
+                            monitor.clone(),
+                        )
+                    }),
                 )
                 .await
             {
@@ -95,11 +115,59 @@ async fn main() {
     }
 }
 
+fn load_config() -> Config {
+    let bind = env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8011".to_string());
+
+    let default_target = "http://localhost:3011";
+    let target_str = env::var("TARGET").unwrap_or_else(|_| default_target.to_string());
+    let (target, target_authority) = target_str
+        .parse::<Uri>()
+        .ok()
+        .and_then(|uri| uri.authority().cloned().map(|auth| (uri, auth)))
+        .unwrap_or_else(|| panic!("TARGET must be a valid URI with host (e.g. {default_target})"));
+
+    let log_path = env::var("LOG_FILE").unwrap_or_else(|_| "heavy.jsonl".to_string());
+
+    let latency_weight: f64 = env::var("LATENCY_WEIGHT")
+        .ok()
+        .map(|v| {
+            v.parse()
+                .expect("LATENCY_WEIGHT must be a number between 0 and 1")
+        })
+        .unwrap_or(0.01);
+
+    let latency_high_ms: f64 = env::var("LATENCY_HIGH_MS")
+        .ok()
+        .map(|v| v.parse().expect("LATENCY_HIGH_MS must be a number"))
+        .unwrap_or(500.0);
+
+    let latency_low_ms: f64 = env::var("LATENCY_LOW_MS")
+        .ok()
+        .map(|v| v.parse().expect("LATENCY_LOW_MS must be a number"))
+        .unwrap_or(250.0);
+
+    assert!(
+        latency_low_ms < latency_high_ms,
+        "LATENCY_LOW_MS ({latency_low_ms}) must be less than LATENCY_HIGH_MS ({latency_high_ms})"
+    );
+
+    Config {
+        bind,
+        target,
+        target_authority,
+        log_path,
+        latency_weight,
+        latency_high_ms,
+        latency_low_ms,
+    }
+}
+
 /// Proxy a single request to the target, log metadata, and return the response.
 async fn handle_request(
     req: Request<Incoming>,
     target_authority: hyper::http::uri::Authority,
     log_tx: mpsc::UnboundedSender<String>,
+    monitor: Arc<LatencyMonitor>,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -150,7 +218,24 @@ async fn handle_request(
             (502, resp)
         }
     };
-    let latency_ms = start.elapsed().as_millis() as u64;
+    let latency_ms = start.elapsed().as_millis() as f64;
+
+    // Update the latency monitor and log state transitions
+    let changed = monitor.update(latency_ms);
+    let high_load = monitor.is_high_load();
+    if changed {
+        if high_load {
+            eprintln!(
+                "heavy: entering high load (avg latency {:.1}ms)",
+                monitor.average()
+            );
+        } else {
+            eprintln!(
+                "heavy: leaving high load (avg latency {:.1}ms)",
+                monitor.average()
+            );
+        }
+    }
 
     // Send the log entry to the writer task
     let entry = serde_json::json!({
@@ -159,7 +244,9 @@ async fn handle_request(
         "path": path,
         "headers": Value::Object(logged_headers),
         "status": status,
-        "latency_ms": latency_ms,
+        "latency_ms": latency_ms as u32,
+        "avg_latency_ms": (monitor.average() * 1000.0).round() / 1000.0,
+        "high_load": high_load,
     });
     let _ = log_tx.send(entry.to_string());
 
