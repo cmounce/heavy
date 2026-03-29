@@ -181,6 +181,11 @@ async fn handle_request(
     monitor: Arc<LatencyMonitor>,
     challenge_all: bool,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
+    // Intercept Heavy's own routes before anything else
+    if req.uri().path().starts_with("/__heavy/") {
+        return Ok(handle_heavy(&req));
+    }
+
     if challenge_all && !cookie_values(&req, "_heavy-token").any(|v| v == "pass") {
         return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -272,6 +277,34 @@ async fn handle_request(
     let _ = log_tx.send(entry.to_string());
 
     Ok(resp_body)
+}
+
+/// Handle requests to Heavy's own `/__heavy/` namespace.
+fn handle_heavy<B>(req: &Request<B>) -> Response<Either<Incoming, Full<Bytes>>> {
+    match (req.method(), req.uri().path()) {
+        (&hyper::Method::POST, "/__heavy/pass") => {
+            // Placeholder challenge verification: accept unconditionally, set the cookie, and
+            // redirect back. The real PoW flow will validate a proof before setting the cookie.
+            let location = req
+                .headers()
+                .get(header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("/");
+            Response::builder()
+                .status(StatusCode::SEE_OTHER)
+                .header(
+                    "Set-Cookie",
+                    "_heavy-token=pass; Path=/; Max-Age=30; SameSite=Lax",
+                )
+                .header("Location", location)
+                .body(Either::Right(Full::new(Bytes::new())))
+                .unwrap()
+        }
+        _ => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Either::Right(Full::new(Bytes::from("404 Not Found\n"))))
+            .unwrap(),
+    }
 }
 
 /// Open a TCP connection to the target and send a request with header case preservation.

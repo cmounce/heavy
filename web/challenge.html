@@ -2,13 +2,12 @@
 <html>
 <head><title>Hold on...</title></head>
 <body>
-<noscript>This site requires JavaScript to verify your browser.</noscript>
+<form method="POST" action="/__heavy/pass">
+    <noscript><button type="submit">Continue</button></noscript>
+</form>
 <script>
     document.write("Please wait, redirecting...");
-    setTimeout(() => {
-        document.cookie = "_heavy-token=pass; path=/; max-age=30; SameSite=Lax";
-        location.reload();
-    }, 3000);
+    setTimeout(() => document.forms[0].submit(), 3000);
 </script>
 </body>
 </html>
