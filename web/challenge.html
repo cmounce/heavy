@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<head><title>Hold on...</title></head>
+<body>
+<noscript>This site requires JavaScript to verify your browser.</noscript>
+<script>
+    document.write("Please wait, redirecting...");
+    setTimeout(() => {
+        document.cookie = "_heavy-token=pass; path=/; max-age=30; SameSite=Lax";
+        location.reload();
+    }, 3000);
+</script>
+</body>
+</html>

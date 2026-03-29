@@ -19,6 +19,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+const CHALLENGE_HTML: &str = include_str!("../web/challenge.html");
+
 struct Config {
     bind: String,
     target: Uri,
@@ -27,6 +29,7 @@ struct Config {
     latency_weight: f64,
     latency_high_ms: f64,
     latency_low_ms: f64,
+    challenge_all: bool,
 }
 
 #[tokio::main]
@@ -70,6 +73,9 @@ async fn main() {
         "heavy: listening on {}, proxying to {}, logging to {}",
         config.bind, config.target, config.log_path
     );
+    if config.challenge_all {
+        eprintln!("heavy: challenge mode enabled (all requests)");
+    }
 
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -83,6 +89,7 @@ async fn main() {
         let target_authority = config.target_authority.clone();
         let log_tx = log_tx.clone();
         let monitor = monitor.clone();
+        let challenge_all = config.challenge_all;
 
         // tokio::spawn moves the connection onto its own async task, so the accept loop
         // immediately continues waiting for the next connection.
@@ -104,6 +111,7 @@ async fn main() {
                             target_authority.clone(),
                             log_tx.clone(),
                             monitor.clone(),
+                            challenge_all,
                         )
                     }),
                 )
@@ -151,6 +159,8 @@ fn load_config() -> Config {
         "LATENCY_LOW_MS ({latency_low_ms}) must be less than LATENCY_HIGH_MS ({latency_high_ms})"
     );
 
+    let challenge_all = env::var("CHALLENGE_ALL").is_ok();
+
     Config {
         bind,
         target,
@@ -159,6 +169,7 @@ fn load_config() -> Config {
         latency_weight,
         latency_high_ms,
         latency_low_ms,
+        challenge_all,
     }
 }
 
@@ -168,7 +179,17 @@ async fn handle_request(
     target_authority: hyper::http::uri::Authority,
     log_tx: mpsc::UnboundedSender<String>,
     monitor: Arc<LatencyMonitor>,
+    challenge_all: bool,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
+    if challenge_all && !cookie_values(&req, "_heavy-token").any(|v| v == "pass") {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .header("Cache-Control", "no-store")
+            .body(Either::Right(Full::new(Bytes::from(CHALLENGE_HTML))))
+            .unwrap());
+    }
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -277,6 +298,19 @@ async fn connect_and_send(
     Ok(sender.send_request(req).await?)
 }
 
+/// Extract all values for a named cookie from the request's Cookie headers.
+fn cookie_values<'a, B>(req: &'a Request<B>, name: &'a str) -> impl Iterator<Item = &'a str> {
+    req.headers()
+        .get_all(header::COOKIE)
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(move |pair| {
+            let (k, v) = pair.trim().split_once('=')?;
+            (k == name).then_some(v)
+        })
+}
+
 /// Iterate over headers that are allowed to be forwarded through the proxy.
 ///
 /// This filters out hop-by-hop headers (headers that only apply to a direct connection between two
@@ -360,5 +394,36 @@ mod tests {
         headers.insert("x-baz", "3".parse().unwrap());
 
         assert_eq!(header_names(&headers), vec!["x-bar"]);
+    }
+
+    #[test]
+    fn cookie_values_from_single_header() {
+        let req = Request::builder()
+            .header(header::COOKIE, "foo=bar; _heavy-token=pass; baz=qux")
+            .body(())
+            .unwrap();
+        let vals: Vec<_> = cookie_values(&req, "_heavy-token").collect();
+        assert_eq!(vals, vec!["pass"]);
+    }
+
+    #[test]
+    fn cookie_values_from_multiple_headers() {
+        let req = Request::builder()
+            .header(header::COOKIE, "foo=bar")
+            .header(header::COOKIE, "_heavy-token=abc")
+            .body(())
+            .unwrap();
+        let vals: Vec<_> = cookie_values(&req, "_heavy-token").collect();
+        assert_eq!(vals, vec!["abc"]);
+    }
+
+    #[test]
+    fn cookie_values_missing() {
+        let req = Request::builder()
+            .header(header::COOKIE, "foo=bar; baz=qux; _heavy-token-extra=1")
+            .body(())
+            .unwrap();
+        let vals: Vec<_> = cookie_values(&req, "_heavy-token").collect();
+        assert!(vals.is_empty());
     }
 }
