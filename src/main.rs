@@ -234,7 +234,16 @@ async fn handle_request(
         return Ok(handle_heavy(&req));
     }
 
-    if challenge_all && !cookie_values(&req, "_heavy-token").any(|v| v == "pass") {
+    // Decide whether this request needs to solve a challenge before we proxy it. Sub-resource
+    // requests (images, scripts, etc) always bypass challenges, so pages don't break mid-load.
+    //
+    // TODO: We shouldn't rely solely on header values in the future because this makes it
+    // straightforward to bypass Heavy if a scraper knows the "trick".
+    let challenges_on = challenge_all || monitor.is_high_load();
+    if challenges_on
+        && !is_subresource_request(req.headers())
+        && !cookie_values(&req, "_heavy-token").any(|v| v == "pass")
+    {
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/html; charset=utf-8")
@@ -394,6 +403,17 @@ fn cookie_values<'a, B>(req: &'a Request<B>, name: &'a str) -> impl Iterator<Ite
         })
 }
 
+/// Whether the request is for a sub-resource (image, CSS, etc) as opposed to a top-level page load.
+///
+/// This is a heuristic based on the `Sec-Fetch-Mode` header. Older browsers (and non-browsers, such
+/// as Curl) might not set it. And of course, a malicious client can always lie to us.
+fn is_subresource_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-mode")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|mode| mode != "navigate")
+}
+
 /// Iterate over headers that are allowed to be forwarded through the proxy.
 ///
 /// This filters out hop-by-hop headers (headers that only apply to a direct connection between two
@@ -508,5 +528,23 @@ mod tests {
             .unwrap();
         let vals: Vec<_> = cookie_values(&req, "_heavy-token").collect();
         assert!(vals.is_empty());
+    }
+
+    #[test]
+    fn resource_only_on_navigate() {
+        let sec_fetch_mode = |val: &str| -> HeaderMap {
+            let mut result = HeaderMap::new();
+            result.insert("sec-fetch-mode", val.parse().unwrap());
+            result
+        };
+        for val in ["cors", "no-cors", "same-origin", "websocket"] {
+            assert!(is_subresource_request(&sec_fetch_mode(val)));
+        }
+        assert!(!is_subresource_request(&sec_fetch_mode("navigate")));
+    }
+
+    #[test]
+    fn assume_resource_without_fetch_mode() {
+        assert!(!is_subresource_request(&HeaderMap::new()));
     }
 }
