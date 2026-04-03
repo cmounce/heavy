@@ -17,15 +17,22 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 const CHALLENGE_HTML: &str = include_str!("../web/challenge.html");
+
+/// A request to the access logger task to perform some action.
+enum LogCmd {
+    Append(String),
+    Reopen,
+}
 
 struct Config {
     bind: String,
     target: Uri,
     target_authority: hyper::http::uri::Authority,
-    log_path: String,
+    access_log: Option<String>,
     latency_weight: f64,
     latency_high_ms: f64,
     latency_low_ms: f64,
@@ -36,28 +43,66 @@ struct Config {
 async fn main() {
     let config = load_config();
 
-    // Open the log file in append mode and spawn a dedicated writer task
-    let log_file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&config.log_path)
-        .await
-        .unwrap_or_else(|e| panic!("failed to open log file {}: {e}", config.log_path));
-    let (log_tx, mut log_rx) = mpsc::unbounded_channel::<String>();
-    tokio::spawn(async move {
-        let mut writer = tokio::io::BufWriter::new(log_file);
-        while let Some(line) = log_rx.recv().await {
-            if let Err(e) = async {
-                writer.write_all(line.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await
-            }
+    // If access logging is enabled: Open the log in append mode and spawn a dedicated writer task
+    let log_tx = if let Some(ref log_path) = config.access_log {
+        let log_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
             .await
-            {
-                eprintln!("heavy: log write failed: {e}");
+            .unwrap_or_else(|e| panic!("failed to open log file {log_path}: {e}"));
+        let (tx, mut rx) = mpsc::unbounded_channel::<LogCmd>();
+        let path = log_path.clone();
+        tokio::spawn(async move {
+            let mut writer = tokio::io::BufWriter::new(log_file);
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    LogCmd::Append(line) => {
+                        if let Err(e) = async {
+                            writer.write_all(line.as_bytes()).await?;
+                            writer.write_all(b"\n").await?;
+                            writer.flush().await
+                        }
+                        .await
+                        {
+                            eprintln!("heavy: log write failed: {e}");
+                        }
+                    }
+                    LogCmd::Reopen => {
+                        let _ = writer.flush().await;
+                        match tokio::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .await
+                        {
+                            Ok(new_file) => {
+                                writer = tokio::io::BufWriter::new(new_file);
+                                eprintln!("heavy: reopened log file {path}");
+                            }
+                            Err(e) => eprintln!("heavy: failed to reopen log file {path}: {e}"),
+                        }
+                    }
+                }
             }
-        }
-    });
+        });
+
+        // Reopen the log file on SIGHUP. This is for logrotate compatibility; when the old log file
+        // is renamed, our existing file handle continues to point to the old log. SIGHUP is how
+        // logrotate tells us to start writing to a new one.
+        let sighup_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut sig = signal(SignalKind::hangup()).expect("failed to register SIGHUP handler");
+            loop {
+                sig.recv().await;
+                let _ = sighup_tx.send(LogCmd::Reopen);
+            }
+        });
+
+        Some(tx)
+    } else {
+        None
+    };
 
     let listener = TcpListener::bind(&config.bind)
         .await
@@ -70,11 +115,14 @@ async fn main() {
     ));
 
     eprintln!(
-        "heavy: listening on {}, proxying to {}, logging to {}",
-        config.bind, config.target, config.log_path
+        "heavy: listening on {}, proxying to {}",
+        config.bind, config.target
     );
+    if let Some(path) = &config.access_log {
+        eprintln!("heavy: access logs enabled, writing to {path}")
+    }
     if config.challenge_all {
-        eprintln!("heavy: challenge mode enabled (all requests)");
+        eprintln!("heavy: WARNING: challenge mode enabled for all requests");
     }
 
     loop {
@@ -134,7 +182,7 @@ fn load_config() -> Config {
         .and_then(|uri| uri.authority().cloned().map(|auth| (uri, auth)))
         .unwrap_or_else(|| panic!("TARGET must be a valid URI with host (e.g. {default_target})"));
 
-    let log_path = env::var("LOG_FILE").unwrap_or_else(|_| "heavy.jsonl".to_string());
+    let access_log = env::var("ACCESS_LOG").ok();
 
     let latency_weight: f64 = env::var("LATENCY_WEIGHT")
         .ok()
@@ -165,7 +213,7 @@ fn load_config() -> Config {
         bind,
         target,
         target_authority,
-        log_path,
+        access_log,
         latency_weight,
         latency_high_ms,
         latency_low_ms,
@@ -177,7 +225,7 @@ fn load_config() -> Config {
 async fn handle_request(
     req: Request<Incoming>,
     target_authority: hyper::http::uri::Authority,
-    log_tx: mpsc::UnboundedSender<String>,
+    log_tx: Option<mpsc::UnboundedSender<LogCmd>>,
     monitor: Arc<LatencyMonitor>,
     challenge_all: bool,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
@@ -263,18 +311,20 @@ async fn handle_request(
         }
     }
 
-    // Send the log entry to the writer task
-    let entry = serde_json::json!({
-        "timestamp": timestamp_secs,
-        "method": method,
-        "path": path,
-        "headers": Value::Object(logged_headers),
-        "status": status,
-        "latency_ms": latency_ms as u32,
-        "avg_latency_ms": (monitor.average() * 1000.0).round() / 1000.0,
-        "high_load": high_load,
-    });
-    let _ = log_tx.send(entry.to_string());
+    // Send the log entry to the writer task (if logging is enabled)
+    if let Some(ref log_tx) = log_tx {
+        let entry = serde_json::json!({
+            "timestamp": timestamp_secs,
+            "method": method,
+            "path": path,
+            "headers": Value::Object(logged_headers),
+            "status": status,
+            "latency_ms": latency_ms as u32,
+            "avg_latency_ms": (monitor.average() * 1000.0).round() / 1000.0,
+            "high_load": high_load,
+        });
+        let _ = log_tx.send(LogCmd::Append(entry.to_string()));
+    }
 
     Ok(resp_body)
 }
