@@ -9,3 +9,5 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-lega
 http-body-util = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
+askama = "0.15"
+getrandom = "0.3"

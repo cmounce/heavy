@@ -7,6 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use latency::LatencyMonitor;
 
+use askama::Template;
 use http_body_util::{Either, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderName};
@@ -20,7 +21,15 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-const CHALLENGE_HTML: &str = include_str!("../web/challenge.html");
+const WORKER_JS: &str = include_str!("../web/worker.js");
+
+#[derive(Template)]
+#[template(path = "challenge.html")]
+struct ChallengeTemplate {
+    /// 64-char hex string (32 bytes)
+    nonce: String,
+    difficulty: u32,
+}
 
 /// A request to the access logger task to perform some action.
 enum LogCmd {
@@ -37,6 +46,7 @@ struct Config {
     latency_high_ms: f64,
     latency_low_ms: f64,
     challenge_all: bool,
+    difficulty: u32,
 }
 
 #[tokio::main]
@@ -138,6 +148,7 @@ async fn main() {
         let log_tx = log_tx.clone();
         let monitor = monitor.clone();
         let challenge_all = config.challenge_all;
+        let difficulty = config.difficulty;
 
         // tokio::spawn moves the connection onto its own async task, so the accept loop
         // immediately continues waiting for the next connection.
@@ -160,6 +171,7 @@ async fn main() {
                             log_tx.clone(),
                             monitor.clone(),
                             challenge_all,
+                            difficulty,
                         )
                     }),
                 )
@@ -209,6 +221,11 @@ fn load_config() -> Config {
 
     let challenge_all = env::var("CHALLENGE_ALL").is_ok();
 
+    let difficulty: u32 = env::var("DIFFICULTY")
+        .ok()
+        .map(|v| v.parse().expect("DIFFICULTY must be a number"))
+        .unwrap_or(20);
+
     Config {
         bind,
         target,
@@ -218,6 +235,7 @@ fn load_config() -> Config {
         latency_high_ms,
         latency_low_ms,
         challenge_all,
+        difficulty,
     }
 }
 
@@ -228,6 +246,7 @@ async fn handle_request(
     log_tx: Option<mpsc::UnboundedSender<LogCmd>>,
     monitor: Arc<LatencyMonitor>,
     challenge_all: bool,
+    difficulty: u32,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
     // Intercept Heavy's own routes before anything else
     if req.uri().path().starts_with("/__heavy/") {
@@ -244,11 +263,17 @@ async fn handle_request(
         && !is_subresource_request(req.headers())
         && !cookie_values(&req, "_heavy-token").any(|v| v == "pass")
     {
+        // Random nonce for now. Eventually this will be a hash of a timestamp and the client's
+        // info, in order to prevent reusing PoW solutions.
+        let mut nonce_bytes = [0u8; 32];
+        getrandom::fill(&mut nonce_bytes).unwrap();
+        let nonce: String = nonce_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let html = ChallengeTemplate { nonce, difficulty }.render().unwrap();
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/html; charset=utf-8")
             .header("Cache-Control", "no-store")
-            .body(Either::Right(Full::new(Bytes::from(CHALLENGE_HTML))))
+            .body(Either::Right(Full::new(Bytes::from(html))))
             .unwrap());
     }
 
@@ -341,6 +366,11 @@ async fn handle_request(
 /// Handle requests to Heavy's own `/__heavy/` namespace.
 fn handle_heavy<B>(req: &Request<B>) -> Response<Either<Incoming, Full<Bytes>>> {
     match (req.method(), req.uri().path()) {
+        (&hyper::Method::GET, "/__heavy/worker.js") => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/javascript")
+            .body(Either::Right(Full::new(Bytes::from(WORKER_JS))))
+            .unwrap(),
         (&hyper::Method::POST, "/__heavy/pass") => {
             // Placeholder challenge verification: accept unconditionally, set the cookie, and
             // redirect back. The real PoW flow will validate a proof before setting the cookie.

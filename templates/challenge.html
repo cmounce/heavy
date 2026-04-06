@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head><title>Please wait...</title></head>
+<body>
+<p id="status">Please wait...</p>
+<form method="POST" action="/__heavy/pass" id="challenge-form">
+    <input type="hidden" name="nonce" id="nonce" value="{{ nonce }}">
+    <input type="hidden" name="offsets" id="offsets">
+    <noscript><p>This site requires JavaScript to verify your browser.</p></noscript>
+</form>
+<script>
+    const nonce = document.getElementById("nonce").value;
+    const difficulty = {{ difficulty }};
+    const worker = new Worker("/__heavy/worker.js");
+    worker.postMessage({ nonce: nonce, difficulty: difficulty });
+    worker.onmessage = (msg) => {
+        if (msg.data.type === "progress") {
+            document.getElementById("status").textContent =
+                "Please wait... (" + msg.data.found + "/10)";
+        } else if (msg.data.type === "done") {
+            document.getElementById("offsets").value = msg.data.offsets.join(",");
+            document.getElementById("challenge-form").submit();
+        }
+    };
+</script>
+</body>
+</html>
