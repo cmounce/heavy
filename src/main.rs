@@ -1,7 +1,7 @@
+mod config;
 mod latency;
 
 use std::convert::Infallible;
-use std::env;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,7 @@ use http_body_util::{Either, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderName};
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use serde_json::{Map, Value};
@@ -37,21 +37,9 @@ enum LogCmd {
     Reopen,
 }
 
-struct Config {
-    bind: String,
-    target: Uri,
-    target_authority: hyper::http::uri::Authority,
-    access_log: Option<String>,
-    latency_weight: f64,
-    latency_high_ms: f64,
-    latency_low_ms: f64,
-    challenge_all: bool,
-    difficulty: u32,
-}
-
 #[tokio::main]
 async fn main() {
-    let config = load_config();
+    let config = config::load();
 
     // If access logging is enabled: Open the log in append mode and spawn a dedicated writer task
     let log_tx = if let Some(ref log_path) = config.access_log {
@@ -180,62 +168,6 @@ async fn main() {
                 eprintln!("heavy: connection error: {e}");
             }
         });
-    }
-}
-
-fn load_config() -> Config {
-    let bind = env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8011".to_string());
-
-    let default_target = "http://localhost:3011";
-    let target_str = env::var("TARGET").unwrap_or_else(|_| default_target.to_string());
-    let (target, target_authority) = target_str
-        .parse::<Uri>()
-        .ok()
-        .and_then(|uri| uri.authority().cloned().map(|auth| (uri, auth)))
-        .unwrap_or_else(|| panic!("TARGET must be a valid URI with host (e.g. {default_target})"));
-
-    let access_log = env::var("ACCESS_LOG").ok();
-
-    let latency_weight: f64 = env::var("LATENCY_WEIGHT")
-        .ok()
-        .map(|v| {
-            v.parse()
-                .expect("LATENCY_WEIGHT must be a number between 0 and 1")
-        })
-        .unwrap_or(0.01);
-
-    let latency_high_ms: f64 = env::var("LATENCY_HIGH_MS")
-        .ok()
-        .map(|v| v.parse().expect("LATENCY_HIGH_MS must be a number"))
-        .unwrap_or(500.0);
-
-    let latency_low_ms: f64 = env::var("LATENCY_LOW_MS")
-        .ok()
-        .map(|v| v.parse().expect("LATENCY_LOW_MS must be a number"))
-        .unwrap_or(250.0);
-
-    assert!(
-        latency_low_ms < latency_high_ms,
-        "LATENCY_LOW_MS ({latency_low_ms}) must be less than LATENCY_HIGH_MS ({latency_high_ms})"
-    );
-
-    let challenge_all = env::var("CHALLENGE_ALL").is_ok();
-
-    let difficulty: u32 = env::var("DIFFICULTY")
-        .ok()
-        .map(|v| v.parse().expect("DIFFICULTY must be a number"))
-        .unwrap_or(20);
-
-    Config {
-        bind,
-        target,
-        target_authority,
-        access_log,
-        latency_weight,
-        latency_high_ms,
-        latency_low_ms,
-        challenge_all,
-        difficulty,
     }
 }
 
