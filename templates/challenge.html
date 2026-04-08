@@ -2,24 +2,37 @@
 <html>
 <head><title>Please wait...</title></head>
 <body>
-<p id="status">Please wait...</p>
-<form method="POST" action="/__heavy/pass" id="challenge-form">
-    <input type="hidden" name="nonce" id="nonce" value="{{ nonce }}">
-    <input type="hidden" name="offsets" id="offsets">
-    <noscript><p>This site requires JavaScript to verify your browser.</p></noscript>
-</form>
+<p id="status"></p>
+<noscript><p>This site requires JavaScript to verify your browser.</p></noscript>
 <script>
-    const nonce = document.getElementById("nonce").value;
-    const difficulty = {{ difficulty }};
+    const puzzle = "{{ puzzle }}";
+    const parts = puzzle.split(".");
+    const timestamp = parseInt(parts[0]);
+    const difficulty = parseInt(parts[1]);
+    const nonce = parts[2];
+
+    document.getElementById("status").textContent = "Please wait...";
     const worker = new Worker("/__heavy/worker.js");
     worker.postMessage({ nonce: nonce, difficulty: difficulty });
-    worker.onmessage = (msg) => {
+    worker.onmessage = async (msg) => {
         if (msg.data.type === "progress") {
             document.getElementById("status").textContent =
                 "Please wait... (" + msg.data.found + "/10)";
         } else if (msg.data.type === "done") {
-            document.getElementById("offsets").value = msg.data.offsets.join(",");
-            document.getElementById("challenge-form").submit();
+            const resp = await fetch("/__heavy/submit", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    offsets: msg.data.offsets,
+                    timestamp,
+                }),
+            });
+            if (resp.ok) {
+                location.reload();
+            } else {
+                document.getElementById("status").textContent =
+                    "Verification failed. Please reload the page to try again.";
+            }
         }
     };
 </script>

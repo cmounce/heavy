@@ -1,14 +1,16 @@
+mod challenge;
 mod config;
 mod latency;
 
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use latency::LatencyMonitor;
 
 use askama::Template;
-use http_body_util::{Either, Full};
+use http_body_util::{BodyExt, Either, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderName};
 use hyper::service::service_fn;
@@ -26,9 +28,15 @@ const WORKER_JS: &str = include_str!("../web/worker.js");
 #[derive(Template)]
 #[template(path = "challenge.html")]
 struct ChallengeTemplate {
-    /// 64-char hex string (32 bytes)
-    nonce: String,
-    difficulty: u32,
+    puzzle: String,
+}
+
+/// Challenge-related configuration shared across request handlers.
+#[derive(Clone, Copy)]
+struct ChallengeConfig {
+    auth: challenge::Authenticator,
+    challenge_all: bool,
+    token_lifetime: u64,
 }
 
 /// A request to the access logger task to perform some action.
@@ -123,8 +131,18 @@ async fn main() {
         eprintln!("heavy: WARNING: challenge mode enabled for all requests");
     }
 
+    let challenge_config = ChallengeConfig {
+        auth: challenge::Authenticator::new(
+            &config.token_secret,
+            config.difficulty,
+            config.token_lifetime,
+        ),
+        challenge_all: config.challenge_all,
+        token_lifetime: config.token_lifetime,
+    };
+
     loop {
-        let (stream, _addr) = match listener.accept().await {
+        let (stream, addr) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 eprintln!("heavy: failed to accept connection: {e}");
@@ -135,8 +153,8 @@ async fn main() {
         let target_authority = config.target_authority.clone();
         let log_tx = log_tx.clone();
         let monitor = monitor.clone();
-        let challenge_all = config.challenge_all;
-        let difficulty = config.difficulty;
+        // IP of the directly-connected peer (usually the reverse proxy, not the end user)
+        let peer_ip = addr.ip();
 
         // tokio::spawn moves the connection onto its own async task, so the accept loop
         // immediately continues waiting for the next connection.
@@ -158,8 +176,8 @@ async fn main() {
                             target_authority.clone(),
                             log_tx.clone(),
                             monitor.clone(),
-                            challenge_all,
-                            difficulty,
+                            challenge_config,
+                            peer_ip,
                         )
                     }),
                 )
@@ -177,12 +195,20 @@ async fn handle_request(
     target_authority: hyper::http::uri::Authority,
     log_tx: Option<mpsc::UnboundedSender<LogCmd>>,
     monitor: Arc<LatencyMonitor>,
-    challenge_all: bool,
-    difficulty: u32,
+    cc: ChallengeConfig,
+    peer_ip: IpAddr,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
+    let client_ip = client_ip(req.headers(), peer_ip);
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
     // Intercept Heavy's own routes before anything else
     if req.uri().path().starts_with("/__heavy/") {
-        return Ok(handle_heavy(&req));
+        return Ok(handle_heavy(req, &cc, client_ip, &user_agent).await);
     }
 
     // Decide whether this request needs to solve a challenge before we proxy it. Sub-resource
@@ -190,17 +216,14 @@ async fn handle_request(
     //
     // TODO: We shouldn't rely solely on header values in the future because this makes it
     // straightforward to bypass Heavy if a scraper knows the "trick".
-    let challenges_on = challenge_all || monitor.is_high_load();
+    let challenges_on = cc.challenge_all || monitor.is_high_load();
     if challenges_on
         && !is_subresource_request(req.headers())
-        && !cookie_values(&req, "_heavy-token").any(|v| v == "pass")
+        && !cookie_values(&req, "_heavy-token")
+            .any(|v| cc.auth.verify_token(client_ip, &user_agent, v))
     {
-        // Random nonce for now. Eventually this will be a hash of a timestamp and the client's
-        // info, in order to prevent reusing PoW solutions.
-        let mut nonce_bytes = [0u8; 32];
-        getrandom::fill(&mut nonce_bytes).unwrap();
-        let nonce: String = nonce_bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let html = ChallengeTemplate { nonce, difficulty }.render().unwrap();
+        let puzzle = cc.auth.make_puzzle(client_ip, &user_agent);
+        let html = ChallengeTemplate { puzzle }.render().unwrap();
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/html; charset=utf-8")
@@ -296,36 +319,60 @@ async fn handle_request(
 }
 
 /// Handle requests to Heavy's own `/__heavy/` namespace.
-fn handle_heavy<B>(req: &Request<B>) -> Response<Either<Incoming, Full<Bytes>>> {
-    match (req.method(), req.uri().path()) {
-        (&hyper::Method::GET, "/__heavy/worker.js") => Response::builder()
+async fn handle_heavy(
+    req: Request<Incoming>,
+    cc: &ChallengeConfig,
+    client_ip: IpAddr,
+    user_agent: &str,
+) -> Response<Either<Incoming, Full<Bytes>>> {
+    match (req.method().clone(), req.uri().path()) {
+        (hyper::Method::GET, "/__heavy/worker.js") => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/javascript")
             .body(Either::Right(Full::new(Bytes::from(WORKER_JS))))
             .unwrap(),
-        (&hyper::Method::POST, "/__heavy/pass") => {
-            // Placeholder challenge verification: accept unconditionally, set the cookie, and
-            // redirect back. The real PoW flow will validate a proof before setting the cookie.
-            let location = req
-                .headers()
-                .get(header::REFERER)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("/");
-            Response::builder()
-                .status(StatusCode::SEE_OTHER)
-                .header(
-                    "Set-Cookie",
-                    "_heavy-token=pass; Path=/; Max-Age=30; SameSite=Lax",
-                )
-                .header("Location", location)
-                .body(Either::Right(Full::new(Bytes::new())))
-                .unwrap()
+        (hyper::Method::POST, "/__heavy/submit") => {
+            verify_and_issue_token(req, cc, client_ip, user_agent).await
         }
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Either::Right(Full::new(Bytes::from("404 Not Found\n"))))
             .unwrap(),
     }
+}
+
+/// Verify a proof-of-work solution and mint a token cookie on success.
+async fn verify_and_issue_token(
+    req: Request<Incoming>,
+    cc: &ChallengeConfig,
+    client_ip: IpAddr,
+    user_agent: &str,
+) -> Response<Either<Incoming, Full<Bytes>>> {
+    let bad_request = || {
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Either::Right(Full::new(Bytes::from("400 Bad Request\n"))))
+            .unwrap()
+    };
+
+    let body = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return bad_request(),
+    };
+
+    let Some(token) = cc.auth.redeem_solution(client_ip, user_agent, &body) else {
+        return bad_request();
+    };
+
+    let cookie = format!(
+        "_heavy-token={token}; Path=/; Max-Age={}; SameSite=Lax",
+        cc.token_lifetime
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Set-Cookie", cookie)
+        .body(Either::Right(Full::new(Bytes::new())))
+        .unwrap()
 }
 
 /// Open a TCP connection to the target and send a request with header case preservation.
@@ -363,6 +410,75 @@ fn cookie_values<'a, B>(req: &'a Request<B>, name: &'a str) -> impl Iterator<Ite
             let (k, v) = pair.trim().split_once('=')?;
             (k == name).then_some(v)
         })
+}
+
+/// Extract the client IP from request headers, checking standard proxy headers.
+///
+/// Checks X-Real-IP, X-Forwarded-For (leftmost entry), and the Forwarded header (first `for=`
+/// directive) in that order, falling back to the peer socket address.
+///
+/// TODO: Think about how we want to configure and secure IP extraction. Concerns include:
+/// - A malicious client can forge proxy headers if the reverse proxy doesn't strip/overwrite them
+/// - Silently falling back to peer_ip when headers are missing could mask a misconfigured proxy
+///   (e.g., everything looks like localhost), and the admin should find out so they can fix it
+/// - We may want to let the admin choose which header(s) to trust
+fn client_ip(headers: &HeaderMap, peer_ip: IpAddr) -> IpAddr {
+    // X-Real-IP: a single IP set by the reverse proxy
+    if let Some(ip) = headers
+        .get("X-Real-IP")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok())
+    {
+        return ip;
+    }
+
+    // X-Forwarded-For: comma-separated list, leftmost is the original client
+    if let Some(ip) = headers
+        .get("X-Forwarded-For")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+    {
+        return ip;
+    }
+
+    // Forwarded: RFC 7239, look for the first `for=` directive
+    if let Some(ip) = headers
+        .get("Forwarded")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_forwarded_for)
+    {
+        return ip;
+    }
+
+    peer_ip
+}
+
+/// Parse the first `for=` directive from an RFC 7239 Forwarded header value.
+fn parse_forwarded_for(header: &str) -> Option<IpAddr> {
+    for param in header.split([',', ';']) {
+        let param = param.trim();
+        let (key, value) = param.split_once('=')?;
+        if !key.eq_ignore_ascii_case("for") {
+            continue;
+        }
+        let value = value.trim_matches('"');
+        // Direct parse (bare IPv4 or IPv6)
+        if let Ok(ip) = value.parse() {
+            return Some(ip);
+        }
+        // Bracketed IPv6 with optional port: [2001:db8::1]:8080
+        if let Some(rest) = value.strip_prefix('[') {
+            if let Some((addr, _)) = rest.split_once(']') {
+                return addr.parse().ok();
+            }
+        }
+        // IPv4 with port: 192.0.2.1:8080
+        if let Some((addr, _)) = value.rsplit_once(':') {
+            return addr.parse().ok();
+        }
+    }
+    None
 }
 
 /// Whether the request is for a sub-resource (image, CSS, etc) as opposed to a top-level page load.
@@ -508,5 +624,47 @@ mod tests {
     #[test]
     fn assume_resource_without_fetch_mode() {
         assert!(!is_subresource_request(&HeaderMap::new()));
+    }
+
+    const LOCALHOST: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+
+    #[test]
+    fn client_ip_from_x_real_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Real-IP", "10.0.0.1".parse().unwrap());
+        assert_eq!(client_ip(&headers, LOCALHOST).to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn client_ip_from_x_forwarded_for() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            "10.0.0.1, 12.34.56.78, 98.76.54.32".parse().unwrap(),
+        );
+        assert_eq!(client_ip(&headers, LOCALHOST).to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn client_ip_from_forwarded() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Forwarded",
+            "for=10.0.0.1;proto=http;by=12.34.56.78".parse().unwrap(),
+        );
+        assert_eq!(client_ip(&headers, LOCALHOST).to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn client_ip_forwarded_ipv6_bracketed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Forwarded", "for=\"[fd00::1]\"".parse().unwrap());
+        assert_eq!(client_ip(&headers, LOCALHOST).to_string(), "fd00::1");
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_peer() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(client_ip(&HeaderMap::new(), peer), peer);
     }
 }

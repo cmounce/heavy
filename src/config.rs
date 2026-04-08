@@ -14,6 +14,10 @@ pub struct Config {
     pub latency_low_ms: f64,
     pub challenge_all: bool,
     pub difficulty: u32,
+    /// Secret string used to derive puzzle and token keys.
+    pub token_secret: String,
+    /// How long a token (and its cookie) remain valid, in seconds.
+    pub token_lifetime: u64,
 }
 
 /// TOML file representation. Every field is optional; missing keys are treated as unset.
@@ -28,6 +32,8 @@ struct FileConfig {
     latency_low_ms: Option<f64>,
     challenge_all: Option<bool>,
     difficulty: Option<u32>,
+    token_secret: Option<String>,
+    token_lifetime: Option<u64>,
 }
 
 /// Load configuration from the config file and environment variables.
@@ -65,6 +71,16 @@ pub fn load() -> Config {
         .and_then(|uri| uri.authority().cloned().map(|auth| (uri, auth)))
         .unwrap_or_else(|| panic!("target must be a valid URI with host (e.g. {default_target})"));
 
+    // Helper: Generate a random secret string for when one isn't configured
+    let gen_secret = || {
+        eprintln!(
+            "heavy: no token_secret configured, using random key (tokens won't survive restarts)"
+        );
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).unwrap();
+        hex::encode(bytes)
+    };
+
     // Resolve and check remaining config fields
     let result = Config {
         bind: resolve!(bind, "BIND", || "0.0.0.0:8011".into()),
@@ -76,6 +92,8 @@ pub fn load() -> Config {
         latency_low_ms: resolve!(latency_low_ms, "LATENCY_LOW_MS", 250.0),
         challenge_all: resolve!(challenge_all, "CHALLENGE_ALL", false),
         difficulty: resolve!(difficulty, "DIFFICULTY", 20),
+        token_secret: resolve!(token_secret, "TOKEN_SECRET", || gen_secret()),
+        token_lifetime: resolve!(token_lifetime, "TOKEN_LIFETIME", 60 * 60 * 24 * 7),
     };
 
     assert!(
