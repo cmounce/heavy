@@ -4,6 +4,8 @@ use std::path::Path;
 use hyper::Uri;
 use serde::Deserialize;
 
+use crate::whitelist::{FileWhitelist, Whitelist};
+
 pub struct Config {
     pub bind: String,
     pub target: Uri,
@@ -18,6 +20,7 @@ pub struct Config {
     pub token_secret: String,
     /// How long a token (and its cookie) remain valid, in seconds.
     pub token_lifetime: u64,
+    pub whitelist: Whitelist,
 }
 
 /// TOML file representation. Every field is optional; missing keys are treated as unset.
@@ -34,6 +37,7 @@ struct FileConfig {
     difficulty: Option<u32>,
     token_secret: Option<String>,
     token_lifetime: Option<u64>,
+    whitelist: Option<FileWhitelist>,
 }
 
 /// Load configuration from the config file and environment variables.
@@ -94,6 +98,7 @@ pub fn load() -> Config {
         difficulty: resolve!(difficulty, "DIFFICULTY", 20),
         token_secret: resolve!(token_secret, "TOKEN_SECRET", || gen_secret()),
         token_lifetime: resolve!(token_lifetime, "TOKEN_LIFETIME", 60 * 60 * 24 * 7),
+        whitelist: Whitelist::from_config(file.whitelist),
     };
 
     assert!(

@@ -1,6 +1,7 @@
 mod challenge;
 mod config;
 mod latency;
+mod whitelist;
 
 use std::convert::Infallible;
 use std::net::IpAddr;
@@ -23,6 +24,8 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
+use crate::whitelist::Whitelist;
+
 const WORKER_JS: &str = include_str!("../web/worker.js");
 
 #[derive(Template)]
@@ -32,11 +35,12 @@ struct ChallengeTemplate {
 }
 
 /// Challenge-related configuration shared across request handlers.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ChallengeConfig {
     auth: challenge::Authenticator,
     challenge_all: bool,
     token_lifetime: u64,
+    whitelist: Arc<Whitelist>,
 }
 
 /// A request to the access logger task to perform some action.
@@ -139,6 +143,7 @@ async fn main() {
         ),
         challenge_all: config.challenge_all,
         token_lifetime: config.token_lifetime,
+        whitelist: Arc::new(config.whitelist),
     };
 
     loop {
@@ -151,6 +156,7 @@ async fn main() {
         };
 
         let target_authority = config.target_authority.clone();
+        let challenge_config = challenge_config.clone();
         let log_tx = log_tx.clone();
         let monitor = monitor.clone();
         // IP of the directly-connected peer (usually the reverse proxy, not the end user)
@@ -176,7 +182,7 @@ async fn main() {
                             target_authority.clone(),
                             log_tx.clone(),
                             monitor.clone(),
-                            challenge_config,
+                            challenge_config.clone(),
                             peer_ip,
                         )
                     }),
@@ -218,6 +224,7 @@ async fn handle_request(
     // straightforward to bypass Heavy if a scraper knows the "trick".
     let challenges_on = cc.challenge_all || monitor.is_high_load();
     if challenges_on
+        && !cc.whitelist.is_exempt(req.uri().path())
         && !is_subresource_request(req.headers())
         && !cookie_values(&req, "_heavy-token")
             .any(|v| cc.auth.verify_token(client_ip, &user_agent, v))
