@@ -1,3 +1,4 @@
+mod access_log;
 mod challenge;
 mod config;
 mod latency;
@@ -19,11 +20,10 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use serde_json::{Map, Value};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
 
+use crate::access_log::AccessLog;
 use crate::whitelist::Whitelist;
 
 const WORKER_JS: &str = include_str!("../web/worker.js");
@@ -43,76 +43,30 @@ struct ChallengeConfig {
     whitelist: Arc<Whitelist>,
 }
 
-/// A request to the access logger task to perform some action.
-enum LogCmd {
-    Append(String),
-    Reopen,
-}
-
 #[tokio::main]
 async fn main() {
     let config = config::load();
 
-    // If access logging is enabled: Open the log in append mode and spawn a dedicated writer task
-    let log_tx = if let Some(ref log_path) = config.access_log {
-        let log_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .await
-            .unwrap_or_else(|e| panic!("failed to open log file {log_path}: {e}"));
-        let (tx, mut rx) = mpsc::unbounded_channel::<LogCmd>();
-        let path = log_path.clone();
-        tokio::spawn(async move {
-            let mut writer = tokio::io::BufWriter::new(log_file);
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    LogCmd::Append(line) => {
-                        if let Err(e) = async {
-                            writer.write_all(line.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
-                            writer.flush().await
-                        }
-                        .await
-                        {
-                            eprintln!("heavy: log write failed: {e}");
-                        }
-                    }
-                    LogCmd::Reopen => {
-                        let _ = writer.flush().await;
-                        match tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)
-                            .await
-                        {
-                            Ok(new_file) => {
-                                writer = tokio::io::BufWriter::new(new_file);
-                                eprintln!("heavy: reopened log file {path}");
-                            }
-                            Err(e) => eprintln!("heavy: failed to reopen log file {path}: {e}"),
-                        }
-                    }
-                }
-            }
-        });
+    // If access logging is enabled, open the log in append mode and spawn a dedicated writer task
+    let access_log = if let Some(ref log_path) = config.access_log {
+        Some(AccessLog::open(log_path).await)
+    } else {
+        None
+    };
 
-        // Reopen the log file on SIGHUP. This is for logrotate compatibility; when the old log file
-        // is renamed, our existing file handle continues to point to the old log. SIGHUP is how
-        // logrotate tells us to start writing to a new one.
-        let sighup_tx = tx.clone();
+    // Reopen the access log on SIGHUP. This is for logrotate compatibility; when the old log file
+    // is renamed, our existing file handle continues to point to the old log. SIGHUP is how
+    // logrotate tells us to start writing to a new one.
+    if let Some(ref access_log) = access_log {
+        let access_log = access_log.clone();
         tokio::spawn(async move {
             let mut sig = signal(SignalKind::hangup()).expect("failed to register SIGHUP handler");
             loop {
                 sig.recv().await;
-                let _ = sighup_tx.send(LogCmd::Reopen);
+                access_log.reopen();
             }
         });
-
-        Some(tx)
-    } else {
-        None
-    };
+    }
 
     let listener = TcpListener::bind(&config.bind)
         .await
@@ -157,7 +111,7 @@ async fn main() {
 
         let target_authority = config.target_authority.clone();
         let challenge_config = challenge_config.clone();
-        let log_tx = log_tx.clone();
+        let access_log = access_log.clone();
         let monitor = monitor.clone();
         // IP of the directly-connected peer (usually the reverse proxy, not the end user)
         let peer_ip = addr.ip();
@@ -180,7 +134,7 @@ async fn main() {
                         handle_request(
                             req,
                             target_authority.clone(),
-                            log_tx.clone(),
+                            access_log.clone(),
                             monitor.clone(),
                             challenge_config.clone(),
                             peer_ip,
@@ -199,7 +153,7 @@ async fn main() {
 async fn handle_request(
     req: Request<Incoming>,
     target_authority: hyper::http::uri::Authority,
-    log_tx: Option<mpsc::UnboundedSender<LogCmd>>,
+    access_log: Option<AccessLog>,
     monitor: Arc<LatencyMonitor>,
     cc: ChallengeConfig,
     peer_ip: IpAddr,
@@ -308,7 +262,7 @@ async fn handle_request(
     }
 
     // Send the log entry to the writer task (if logging is enabled)
-    if let Some(ref log_tx) = log_tx {
+    if let Some(ref access_log) = access_log {
         let entry = serde_json::json!({
             "timestamp": timestamp_secs,
             "method": method,
@@ -319,7 +273,7 @@ async fn handle_request(
             "avg_latency_ms": (monitor.average() * 1000.0).round() / 1000.0,
             "high_load": high_load,
         });
-        let _ = log_tx.send(LogCmd::Append(entry.to_string()));
+        access_log.append(entry.to_string());
     }
 
     Ok(resp_body)
