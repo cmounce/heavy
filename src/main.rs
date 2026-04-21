@@ -1,4 +1,5 @@
 mod access_log;
+mod breaker;
 mod challenge;
 mod config;
 mod latency;
