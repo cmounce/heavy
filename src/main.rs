@@ -2,15 +2,12 @@ mod access_log;
 mod breaker;
 mod challenge;
 mod config;
-mod latency;
 mod whitelist;
 
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-use latency::LatencyMonitor;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use askama::Template;
 use http_body_util::{BodyExt, Either, Full};
@@ -25,6 +22,7 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::access_log::AccessLog;
+use crate::breaker::CircuitBreaker;
 use crate::whitelist::Whitelist;
 
 const WORKER_JS: &str = include_str!("../web/worker.js");
@@ -73,11 +71,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind to {}: {e}", config.bind));
 
-    let monitor = Arc::new(LatencyMonitor::new(
-        config.latency_weight,
-        config.latency_high_ms,
-        config.latency_low_ms,
-    ));
+    let breaker = Arc::new(CircuitBreaker::new(config.circuit_breaker.clone()));
 
     eprintln!(
         "heavy: listening on {}, proxying to {}",
@@ -113,7 +107,7 @@ async fn main() {
         let target_authority = config.target_authority.clone();
         let challenge_config = challenge_config.clone();
         let access_log = access_log.clone();
-        let monitor = monitor.clone();
+        let breaker = breaker.clone();
         // IP of the directly-connected peer (usually the reverse proxy, not the end user)
         let peer_ip = addr.ip();
 
@@ -136,7 +130,7 @@ async fn main() {
                             req,
                             target_authority.clone(),
                             access_log.clone(),
-                            monitor.clone(),
+                            breaker.clone(),
                             challenge_config.clone(),
                             peer_ip,
                         )
@@ -155,7 +149,7 @@ async fn handle_request(
     req: Request<Incoming>,
     target_authority: hyper::http::uri::Authority,
     access_log: Option<AccessLog>,
-    monitor: Arc<LatencyMonitor>,
+    breaker: Arc<CircuitBreaker>,
     cc: ChallengeConfig,
     peer_ip: IpAddr,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
@@ -177,7 +171,7 @@ async fn handle_request(
     //
     // TODO: We shouldn't rely solely on header values in the future because this makes it
     // straightforward to bypass Heavy if a scraper knows the "trick".
-    let challenges_on = cc.challenge_all || monitor.is_high_load();
+    let challenges_on = cc.challenge_all || breaker.is_tripped();
     if challenges_on
         && !cc.whitelist.is_exempt(req.uri().path())
         && !is_subresource_request(req.headers())
@@ -193,11 +187,6 @@ async fn handle_request(
             .body(Either::Right(Full::new(Bytes::from(html))))
             .unwrap());
     }
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let timestamp_secs = timestamp.as_secs() as f64 + timestamp.subsec_millis() as f64 / 1000.0;
 
     // Rewrite URI to point at the target, preserving the original path and query
     let path_and_query = req
@@ -223,7 +212,7 @@ async fn handle_request(
     let outgoing = outgoing.body(body).unwrap();
 
     // Send to the target and measure round-trip latency
-    let start = Instant::now();
+    let start = SystemTime::now();
     let (status, resp_body) = match connect_and_send(target_authority.as_str(), outgoing).await {
         Ok(resp) => {
             let (resp_parts, resp_body) = resp.into_parts();
@@ -243,36 +232,34 @@ async fn handle_request(
             (502, resp)
         }
     };
-    let latency_ms = start.elapsed().as_millis() as f64;
+    let latency = if let Ok(duration) = start.elapsed() {
+        duration.as_secs_f64()
+    } else {
+        0.0
+    };
 
-    // Update the latency monitor and log state transitions
-    let changed = monitor.update(latency_ms);
-    let high_load = monitor.is_high_load();
-    if changed {
-        if high_load {
-            eprintln!(
-                "heavy: entering high load (avg latency {:.1}ms)",
-                monitor.average()
-            );
+    // Feed the circuit breaker and log open/closed transitions
+    let was_tripped = breaker.is_tripped();
+    breaker.update(latency);
+    let tripped = breaker.is_tripped();
+    if tripped != was_tripped {
+        if tripped {
+            eprintln!("heavy: entering high load, circuit breaker tripped");
         } else {
-            eprintln!(
-                "heavy: leaving high load (avg latency {:.1}ms)",
-                monitor.average()
-            );
+            eprintln!("heavy: leaving high load, circuit breaker reset");
         }
     }
 
     // Send the log entry to the writer task (if logging is enabled)
     if let Some(ref access_log) = access_log {
         let entry = serde_json::json!({
-            "timestamp": timestamp_secs,
+            "timestamp": start.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
             "method": method,
             "path": path,
             "headers": Value::Object(logged_headers),
             "status": status,
-            "latency_ms": latency_ms as u32,
-            "avg_latency_ms": (monitor.average() * 1000.0).round() / 1000.0,
-            "high_load": high_load,
+            "latency_ms": (latency * 1000.0) as u32,
+            "tripped": tripped,
         });
         access_log.append(entry.to_string());
     }

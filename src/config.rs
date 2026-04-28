@@ -1,9 +1,12 @@
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use hyper::Uri;
 use serde::Deserialize;
 
+use crate::breaker::CircuitBreakerConfig;
 use crate::whitelist::{FileWhitelist, Whitelist};
 
 pub struct Config {
@@ -11,9 +14,7 @@ pub struct Config {
     pub target: Uri,
     pub target_authority: hyper::http::uri::Authority,
     pub access_log: Option<String>,
-    pub latency_weight: f64,
-    pub latency_high_ms: f64,
-    pub latency_low_ms: f64,
+    pub circuit_breaker: Arc<ArcSwap<CircuitBreakerConfig>>, // `ArcSwap` for future hot reloading
     pub challenge_all: bool,
     pub difficulty: u32,
     /// Secret string used to derive puzzle and token keys.
@@ -30,14 +31,24 @@ struct FileConfig {
     bind: Option<String>,
     target: Option<String>,
     access_log: Option<String>,
-    latency_weight: Option<f64>,
-    latency_high_ms: Option<f64>,
-    latency_low_ms: Option<f64>,
     challenge_all: Option<bool>,
     difficulty: Option<u32>,
     token_secret: Option<String>,
     token_lifetime: Option<u64>,
+    circuit_breaker: Option<FileCircuitBreaker>,
     whitelist: Option<FileWhitelist>,
+}
+
+/// TOML representation of the `[circuit_breaker]` section. All values are in seconds, except
+/// `smoothing` which is the window size for 95% of the latency moving average.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct FileCircuitBreaker {
+    trip_above: Option<f64>,
+    reset_below: Option<f64>,
+    smoothing: Option<f64>,
+    min_open_duration: Option<f64>,
+    backoff_half_life: Option<f64>,
 }
 
 /// Load configuration from the config file and environment variables.
@@ -85,30 +96,34 @@ pub fn load() -> Config {
         hex::encode(bytes)
     };
 
-    // Resolve and check remaining config fields
-    let result = Config {
+    // Build the circuit breaker config. No env-var overrides for these keys.
+    let cb_file = file.circuit_breaker.unwrap_or_default();
+    let breaker_config = CircuitBreakerConfig::new(
+        cb_file.trip_above.unwrap_or(0.500),
+        cb_file.reset_below.unwrap_or(0.250),
+        cb_file.smoothing.unwrap_or(50.0),
+        cb_file.min_open_duration.unwrap_or(60.0),
+        cb_file.backoff_half_life.unwrap_or(60.0),
+    );
+    assert!(
+        breaker_config.reset_below < breaker_config.trip_above,
+        "circuit_breaker.reset_below ({}s) must be less than circuit_breaker.trip_above ({}s)",
+        breaker_config.reset_below,
+        breaker_config.trip_above,
+    );
+
+    Config {
         bind: resolve!(bind, "BIND", || "0.0.0.0:8011".into()),
         target,
         target_authority,
         access_log: env::var("ACCESS_LOG").ok().or(file.access_log),
-        latency_weight: resolve!(latency_weight, "LATENCY_WEIGHT", 0.01),
-        latency_high_ms: resolve!(latency_high_ms, "LATENCY_HIGH_MS", 500.0),
-        latency_low_ms: resolve!(latency_low_ms, "LATENCY_LOW_MS", 250.0),
+        circuit_breaker: Arc::new(ArcSwap::new(Arc::new(breaker_config))),
         challenge_all: resolve!(challenge_all, "CHALLENGE_ALL", false),
         difficulty: resolve!(difficulty, "DIFFICULTY", 20),
         token_secret: resolve!(token_secret, "TOKEN_SECRET", || gen_secret()),
         token_lifetime: resolve!(token_lifetime, "TOKEN_LIFETIME", 60 * 60 * 24 * 7),
         whitelist: Whitelist::from_config(file.whitelist),
-    };
-
-    assert!(
-        result.latency_low_ms < result.latency_high_ms,
-        "latency_low_ms ({}) must be less than latency_high_ms ({})",
-        result.latency_low_ms,
-        result.latency_high_ms,
-    );
-
-    result
+    }
 }
 
 /// Read and parse the TOML config file at the given path.
