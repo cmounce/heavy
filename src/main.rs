@@ -17,7 +17,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -144,7 +144,7 @@ async fn main() {
     }
 }
 
-/// Proxy a single request to the target, log metadata, and return the response.
+/// Time and log a single request, dispatching it to the appropriate handler.
 async fn handle_request(
     req: Request<Incoming>,
     target_authority: hyper::http::uri::Authority,
@@ -153,7 +153,77 @@ async fn handle_request(
     cc: ChallengeConfig,
     peer_ip: IpAddr,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
-    let client_ip = client_ip(req.headers(), peer_ip);
+    // Capture request metadata for logging before handing off the request
+    let method = req.method().to_string();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let mut logged_headers = Map::new();
+    for (name, value) in req.headers() {
+        if let Ok(v) = value.to_str() {
+            logged_headers.insert(name.to_string(), Value::String(v.to_string()));
+        }
+    }
+
+    // Route the request and time it. We use SystemTime instead of Instant because we also need the
+    // absolute time for the access log timestamp.
+    let start = SystemTime::now();
+    let routed = route_request(req, &target_authority, &breaker, &cc, peer_ip).await;
+    let latency = start.elapsed().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+
+    // Only requests we proxied upstream reflect upstream load, so only those feed the circuit
+    // breaker. Challenge HTML and `/__heavy/` routes are served by Heavy itself.
+    let proxied = !routed.challenged && !path.starts_with("/__heavy/");
+    if proxied {
+        // TODO: have breaker.update() return the transition instead of inferring it
+        let was_tripped = breaker.is_tripped();
+        breaker.update(latency);
+        let tripped = breaker.is_tripped();
+        if tripped != was_tripped {
+            if tripped {
+                eprintln!("heavy: entering high load, circuit breaker tripped");
+            } else {
+                eprintln!("heavy: leaving high load, circuit breaker reset");
+            }
+        }
+    }
+
+    if let Some(ref access_log) = access_log {
+        let round = |x: f64| (x * 1000.0).round_ties_even() / 1000.0;
+        let entry = json!({
+            "timestamp": round(start.duration_since(UNIX_EPOCH).map(|x| x.as_secs_f64()).unwrap_or(0.0)),
+            "method": method,
+            "path": path,
+            "headers": Value::Object(logged_headers),
+            "status": routed.response.status().as_u16(),
+            "latency": round(latency),
+            "challenged": routed.challenged,
+        });
+        access_log.append(entry.to_string());
+    }
+
+    Ok(routed.response)
+}
+
+/// The response to a client's request.
+struct RouteResponse {
+    response: Response<Either<Incoming, Full<Bytes>>>,
+    challenged: bool,
+}
+
+/// Respond to an arbitrary client request.
+///
+/// This function is where we decide whether to proxy the request to the upstream service, versus
+/// responding to the request ourselves.
+async fn route_request(
+    req: Request<Incoming>,
+    target_authority: &hyper::http::uri::Authority,
+    breaker: &CircuitBreaker,
+    cc: &ChallengeConfig,
+    peer_ip: IpAddr,
+) -> RouteResponse {
     let user_agent = req
         .headers()
         .get(header::USER_AGENT)
@@ -163,7 +233,11 @@ async fn handle_request(
 
     // Intercept Heavy's own routes before anything else
     if req.uri().path().starts_with("/__heavy/") {
-        return Ok(handle_heavy(req, &cc, client_ip, &user_agent).await);
+        let client_ip = client_ip(req.headers(), peer_ip);
+        return RouteResponse {
+            response: serve_heavy(req, cc, client_ip, &user_agent).await,
+            challenged: false,
+        };
     }
 
     // Decide whether this request needs to solve a challenge before we proxy it. Sub-resource
@@ -175,19 +249,37 @@ async fn handle_request(
     if challenges_on
         && !cc.whitelist.is_exempt(req.uri().path())
         && !is_subresource_request(req.headers())
-        && !cookie_values(&req, "_heavy-token")
-            .any(|v| cc.auth.verify_token(client_ip, &user_agent, v))
     {
-        let puzzle = cc.auth.make_puzzle(client_ip, &user_agent);
-        let html = ChallengeTemplate { puzzle }.render().unwrap();
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/html; charset=utf-8")
-            .header("Cache-Control", "no-store")
-            .body(Either::Right(Full::new(Bytes::from(html))))
-            .unwrap());
+        let client_ip = client_ip(req.headers(), peer_ip);
+        if !cookie_values(&req, "_heavy-token")
+            .any(|v| cc.auth.verify_token(client_ip, &user_agent, v))
+        {
+            let puzzle = cc.auth.make_puzzle(client_ip, &user_agent);
+            let html = ChallengeTemplate { puzzle }.render().unwrap();
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/html; charset=utf-8")
+                .header("Cache-Control", "no-store")
+                .body(Either::Right(Full::new(Bytes::from(html))))
+                .unwrap();
+            return RouteResponse {
+                response,
+                challenged: true,
+            };
+        }
     }
 
+    RouteResponse {
+        response: proxy_upstream(req, target_authority).await,
+        challenged: false,
+    }
+}
+
+/// Forward a request to the upstream target and return its response.
+async fn proxy_upstream(
+    req: Request<Incoming>,
+    target_authority: &hyper::http::uri::Authority,
+) -> Response<Either<Incoming, Full<Bytes>>> {
     // Rewrite URI to point at the target, preserving the original path and query
     let path_and_query = req
         .uri()
@@ -195,80 +287,34 @@ async fn handle_request(
         .map(|pq| pq.to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    // Capture request metadata for logging before we consume the request
-    let method = req.method().to_string();
-    let path = path_and_query.clone();
     let (parts, body) = req.into_parts();
-
-    // Build the outgoing request and collect headers for logging in one pass
     let mut outgoing = Request::builder().method(parts.method).uri(path_and_query);
-    let mut logged_headers = Map::new();
     for (name, value) in filter_headers(&parts.headers) {
         outgoing = outgoing.header(name, value);
-        if let Ok(v) = value.to_str() {
-            logged_headers.insert(name.to_string(), Value::String(v.to_string()));
-        }
     }
     let outgoing = outgoing.body(body).unwrap();
 
-    // Send to the target and measure round-trip latency
-    let start = SystemTime::now();
-    let (status, resp_body) = match connect_and_send(target_authority.as_str(), outgoing).await {
+    match connect_and_send(target_authority.as_str(), outgoing).await {
         Ok(resp) => {
             let (resp_parts, resp_body) = resp.into_parts();
             let mut response = Response::builder().status(resp_parts.status);
             for (name, value) in filter_headers(&resp_parts.headers) {
                 response = response.header(name, value);
             }
-            let status = resp_parts.status.as_u16();
-            (status, response.body(Either::Left(resp_body)).unwrap())
+            response.body(Either::Left(resp_body)).unwrap()
         }
         Err(e) => {
             eprintln!("heavy: upstream request failed: {e}");
-            let resp = Response::builder()
+            Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Either::Right(Full::new(Bytes::from("502 Bad Gateway\n"))))
-                .unwrap();
-            (502, resp)
-        }
-    };
-    let latency = if let Ok(duration) = start.elapsed() {
-        duration.as_secs_f64()
-    } else {
-        0.0
-    };
-
-    // Feed the circuit breaker and log open/closed transitions
-    let was_tripped = breaker.is_tripped();
-    breaker.update(latency);
-    let tripped = breaker.is_tripped();
-    if tripped != was_tripped {
-        if tripped {
-            eprintln!("heavy: entering high load, circuit breaker tripped");
-        } else {
-            eprintln!("heavy: leaving high load, circuit breaker reset");
+                .unwrap()
         }
     }
-
-    // Send the log entry to the writer task (if logging is enabled)
-    if let Some(ref access_log) = access_log {
-        let entry = serde_json::json!({
-            "timestamp": start.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
-            "method": method,
-            "path": path,
-            "headers": Value::Object(logged_headers),
-            "status": status,
-            "latency_ms": (latency * 1000.0) as u32,
-            "tripped": tripped,
-        });
-        access_log.append(entry.to_string());
-    }
-
-    Ok(resp_body)
 }
 
 /// Handle requests to Heavy's own `/__heavy/` namespace.
-async fn handle_heavy(
+async fn serve_heavy(
     req: Request<Incoming>,
     cc: &ChallengeConfig,
     client_ip: IpAddr,
