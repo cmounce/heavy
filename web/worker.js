@@ -3,7 +3,7 @@
  *
  * The server defines a ChaCha8 keystream by providing a 64-digit hex key. This is the `nonce` that
  * defines the challenge. This worker then generates that keystream and searches the output for
- * 32-bit words having at least `difficulty` leading zero bits. The goal is to find 10 word offsets
+ * 32-bit words having at least `difficulty` leading zero bits. The goal is to find 20 word offsets
  * in the keystream where this is the case.
  *
  * Receives:
@@ -15,7 +15,7 @@
  */
 self.onmessage = function(msg) {
     const difficulty = msg.data.difficulty;
-    const num_offsets = 10;
+    const num_offsets = 20;
     const offsets = []; // word offsets into the stream
 
     // Build the initial ChaCha8 input block with the nonce in the key position

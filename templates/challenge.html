@@ -11,13 +11,13 @@
     const difficulty = parseInt(parts[1]);
     const nonce = parts[2];
 
-    document.getElementById("status").textContent = "Please wait...";
+    document.getElementById("status").textContent = "Please wait";
     const worker = new Worker("/__heavy/worker.js");
     worker.postMessage({ nonce: nonce, difficulty: difficulty });
     worker.onmessage = async (msg) => {
         if (msg.data.type === "progress") {
             document.getElementById("status").textContent =
-                "Please wait... (" + msg.data.found + "/10)";
+                "Please wait" + ".".repeat(Math.floor(msg.data.found / 2));
         } else if (msg.data.type === "done") {
             const resp = await fetch("/__heavy/submit", {
                 method: "POST",

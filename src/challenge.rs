@@ -11,7 +11,7 @@ const PUZZLE_LIFETIME: Duration = Duration::from_mins(5);
 
 /// Number of sub-puzzles in a complete proof-of-work. This is a hardcoded part of the PoW
 /// algorithm, i.e., separate from the `difficulty` parameter in Heavy's config.
-const NUM_SOLUTION_OFFSETS: usize = 10;
+const NUM_SOLUTION_OFFSETS: usize = 20;
 
 /// State for working with challenge puzzles and token cookies.
 ///
