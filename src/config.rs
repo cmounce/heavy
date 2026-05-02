@@ -1,5 +1,5 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -7,7 +7,7 @@ use hyper::Uri;
 use serde::Deserialize;
 
 use crate::breaker::CircuitBreakerConfig;
-use crate::whitelist::{FileWhitelist, Whitelist};
+use crate::whitelist::{self, FileWhitelist, Whitelist, WhitelistParams};
 
 pub struct Config {
     pub bind: String,
@@ -58,7 +58,9 @@ struct FileCircuitBreaker {
 /// as empty).
 pub fn load() -> Config {
     // Parse the TOML file if it exists
-    let config_path = env::var("HEAVY_CONFIG").unwrap_or_else(|_| "/etc/heavy/config.toml".into());
+    let config_path: PathBuf = env::var_os("HEAVY_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/heavy/config.toml"));
     let file = load_file(&config_path);
 
     // Helper: Resolve a config field with env var > TOML value > default
@@ -112,6 +114,14 @@ pub fn load() -> Config {
         breaker_config.trip_above,
     );
 
+    // Read any whitelist include files and combine them into a single WhitelistParams
+    let config_dir = config_path.parent().unwrap_or(Path::new("/"));
+    let whitelist_params = if let Some(file_whitelist) = file.whitelist {
+        load_whitelist_params(config_dir, &file_whitelist)
+    } else {
+        WhitelistParams::default()
+    };
+
     Config {
         bind: resolve!(bind, "BIND", || "0.0.0.0:8011".into()),
         target,
@@ -122,19 +132,47 @@ pub fn load() -> Config {
         difficulty: resolve!(difficulty, "DIFFICULTY", 20),
         token_secret: resolve!(token_secret, "TOKEN_SECRET", || gen_secret()),
         token_lifetime: resolve!(token_lifetime, "TOKEN_LIFETIME", 60 * 60 * 24 * 7),
-        whitelist: Whitelist::from_config(file.whitelist),
+        whitelist: Whitelist::new(&whitelist_params),
     }
+}
+
+// Resolve the whitelist rules, following all includes from the main config's `[whitelist]` section.
+fn load_whitelist_params(config_dir: &Path, base: &FileWhitelist) -> WhitelistParams {
+    let mut params = WhitelistParams { paths: vec![] };
+    if let Some(paths) = &base.path {
+        params.paths.extend_from_slice(paths);
+    }
+    for include in base.include.as_deref().unwrap_or(&[]) {
+        let path = if Path::new(include).is_absolute() {
+            PathBuf::from(include)
+        } else {
+            config_dir.join(include)
+        };
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("couldn't read whitelist file {include}: {e}"));
+        let parsed: FileWhitelist = toml::from_str(&contents)
+            .unwrap_or_else(|e| panic!("couldn't parse whitelist file {include}: {e}"));
+        if parsed.include.is_some() {
+            panic!("nested includes in {include} are not allowed");
+        }
+        if let Some(paths) = parsed.path {
+            params.paths.extend(paths);
+        }
+    }
+    params
 }
 
 /// Read and parse the TOML config file at the given path.
 ///
 /// Returns an empty FileConfig if the file doesn't exist. Panics if the file exists but can't be
 /// parsed or contains invalid TOML.
-fn load_file(path: &str) -> FileConfig {
-    if !Path::new(path).exists() {
+fn load_file(path: &Path) -> FileConfig {
+    if !path.exists() {
         return FileConfig::default();
     }
+    let display = path.display();
     let contents = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read config file {path}: {e}"));
-    toml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse config file {path}: {e}"))
+        .unwrap_or_else(|e| panic!("failed to read config file {display}: {e}"));
+    toml::from_str(&contents)
+        .unwrap_or_else(|e| panic!("failed to parse config file {display}: {e}"))
 }
