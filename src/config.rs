@@ -7,7 +7,7 @@ use hyper::Uri;
 use serde::Deserialize;
 
 use crate::breaker::CircuitBreakerConfig;
-use crate::whitelist::{self, FileWhitelist, Whitelist, WhitelistParams};
+use crate::whitelist::{FileWhitelist, Whitelist, WhitelistParams};
 
 pub struct Config {
     pub bind: String,
@@ -138,9 +138,12 @@ pub fn load() -> Config {
 
 // Resolve the whitelist rules, following all includes from the main config's `[whitelist]` section.
 fn load_whitelist_params(config_dir: &Path, base: &FileWhitelist) -> WhitelistParams {
-    let mut params = WhitelistParams { paths: vec![] };
+    let mut params = WhitelistParams::default();
     if let Some(paths) = &base.path {
         params.paths.extend_from_slice(paths);
+    }
+    if let Some(ips) = &base.ip {
+        params.ips.extend_from_slice(ips);
     }
     for include in base.include.as_deref().unwrap_or(&[]) {
         let path = if Path::new(include).is_absolute() {
@@ -157,6 +160,9 @@ fn load_whitelist_params(config_dir: &Path, base: &FileWhitelist) -> WhitelistPa
         }
         if let Some(paths) = parsed.path {
             params.paths.extend(paths);
+        }
+        if let Some(ips) = parsed.ip {
+            params.ips.extend(ips);
         }
     }
     params

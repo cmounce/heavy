@@ -230,10 +230,10 @@ async fn route_request(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let client_ip = client_ip(req.headers(), peer_ip);
 
     // Intercept Heavy's own routes before anything else
     if req.uri().path().starts_with("/__heavy/") {
-        let client_ip = client_ip(req.headers(), peer_ip);
         return RouteResponse {
             response: serve_heavy(req, cc, client_ip, &user_agent).await,
             challenged: false,
@@ -247,10 +247,9 @@ async fn route_request(
     // straightforward to bypass Heavy if a scraper knows the "trick".
     let challenges_on = cc.challenge_all || breaker.is_tripped();
     if challenges_on
-        && !cc.whitelist.is_exempt(req.uri().path())
+        && !cc.whitelist.is_exempt(req.uri().path(), client_ip)
         && !is_subresource_request(req.headers())
     {
-        let client_ip = client_ip(req.headers(), peer_ip);
         if !cookie_values(&req, "_heavy-token")
             .any(|v| cc.auth.verify_token(client_ip, &user_agent, v))
         {
