@@ -1,0 +1,2 @@
+url = "https://www.bing.com/toolbox/bingbot.json"
+pattern = "prefixes.*.*"

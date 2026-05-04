@@ -1,0 +1,2 @@
+url = "https://index.commoncrawl.org/ccbot.json"
+pattern = "prefixes.*.*"

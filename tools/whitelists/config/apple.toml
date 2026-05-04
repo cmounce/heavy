@@ -1,0 +1,2 @@
+url = "https://search.developer.apple.com/applebot.json"
+pattern = "prefixes.*.*"
