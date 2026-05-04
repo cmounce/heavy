@@ -47,9 +47,9 @@ impl Whitelist {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct FileWhitelist {
-    pub path: Option<Vec<String>>,
-    pub ip: Option<Vec<String>>,
-    pub include: Option<Vec<String>>,
+    pub paths: Option<Vec<String>>,
+    pub cidrs: Option<Vec<String>>,
+    pub includes: Option<Vec<String>>,
 }
 
 #[cfg(test)]

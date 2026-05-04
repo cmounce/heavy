@@ -139,13 +139,13 @@ pub fn load() -> Config {
 // Resolve the whitelist rules, following all includes from the main config's `[whitelist]` section.
 fn load_whitelist_params(config_dir: &Path, base: &FileWhitelist) -> WhitelistParams {
     let mut params = WhitelistParams::default();
-    if let Some(paths) = &base.path {
+    if let Some(paths) = &base.paths {
         params.paths.extend_from_slice(paths);
     }
-    if let Some(ips) = &base.ip {
-        params.ips.extend_from_slice(ips);
+    if let Some(cidrs) = &base.cidrs {
+        params.ips.extend_from_slice(cidrs);
     }
-    for include in base.include.as_deref().unwrap_or(&[]) {
+    for include in base.includes.as_deref().unwrap_or(&[]) {
         let path = if Path::new(include).is_absolute() {
             PathBuf::from(include)
         } else {
@@ -155,14 +155,14 @@ fn load_whitelist_params(config_dir: &Path, base: &FileWhitelist) -> WhitelistPa
             .unwrap_or_else(|e| panic!("couldn't read whitelist file {include}: {e}"));
         let parsed: FileWhitelist = toml::from_str(&contents)
             .unwrap_or_else(|e| panic!("couldn't parse whitelist file {include}: {e}"));
-        if parsed.include.is_some() {
+        if parsed.includes.is_some() {
             panic!("nested includes in {include} are not allowed");
         }
-        if let Some(paths) = parsed.path {
+        if let Some(paths) = parsed.paths {
             params.paths.extend(paths);
         }
-        if let Some(ips) = parsed.ip {
-            params.ips.extend(ips);
+        if let Some(cidrs) = parsed.cidrs {
+            params.ips.extend(cidrs);
         }
     }
     params
