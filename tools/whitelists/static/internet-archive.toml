@@ -1,0 +1,8 @@
+# 2026-05-04: https://bgp.he.net/AS7941
+# AS7941 announces a few more prefixes than this, but the additional ones are either
+# not in the global routing table, or they are contained by the CIDRs below.
+cidrs = [
+  "207.241.224.0/20",
+  "208.70.24.0/21",
+  "2620:0:9c0::/48",
+]

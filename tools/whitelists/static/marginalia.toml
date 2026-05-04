@@ -1,0 +1,9 @@
+# 2026-05-04: IP address range from https://about.marginalia-search.com/article/crawler/
+# CIDR calculator: https://account.arin.net/public/cidrCalculator
+cidrs = [
+  "193.183.0.162/31",
+  "193.183.0.164/30",
+  "193.183.0.168/30",
+  "193.183.0.172/31",
+  "193.183.0.174/32",
+]

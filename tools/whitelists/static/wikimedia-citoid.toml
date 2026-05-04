@@ -1,0 +1,9 @@
+# Via Anubis: These CIDRs were given by Citoid's creator on 2026-03-20. As of 2026-05-04, these are
+# still the latest CIDRs in Anubis and are still a subset of the full list from Wikimedia.
+#
+# - https://github.com/TecharoHQ/anubis/pull/1524
+# - https://wikitech.wikimedia.org/wiki/IP_and_AS_allocations
+cidrs = [
+  "208.80.152.0/22",
+  "2620:0:860::/46",
+]
