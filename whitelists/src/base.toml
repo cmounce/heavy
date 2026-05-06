@@ -1,0 +1,9 @@
+# Whitelist standard-ish paths that don't typically contribute to server load and that ought to
+# always be accessible. Most of this is inspired by Anubis's keep-internet-working.yaml.
+paths = [
+    '^/apple-touch-icon[^/]*\.png$',
+    '^/favicon\.[a-z]+$',
+    '^/robots\.txt$',
+    '^/sitemap[^/]*\.xml(\.gz)?$',
+    '^/\.well-known/',
+]

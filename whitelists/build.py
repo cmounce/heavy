@@ -16,6 +16,9 @@ DIST = ROOT / "dist"
 
 # Map of which source files are built into which bundles
 BUNDLES = {
+    "base": [
+        "base",
+    ],
     "crawlers": [
         "apple",
         "bing",
@@ -103,7 +106,11 @@ def format_bundle(whitelists: list[Whitelist]) -> str:
     def put_group(stem: str, values: list[str]):
         lines.append(f"  # {stem}")
         for v in values:
-            lines.append(f'  "{v}",')
+            # Mild hack: use JSON to escape strings because the rules are almost exactly the same as
+            # TOML's. Earlier versions of the TOML spec explicitly call this out: "You may notice
+            # that the above string specification is the same as JSON's string definition," from
+            # https://toml.io/en/v0.3.1#string.
+            lines.append(f"  {json.dumps(v)},")
 
     def put_grouped_array(key: str, groups: dict[str, list[str]]):
         if len(groups) == 0:
