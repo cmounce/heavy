@@ -1,0 +1,2 @@
+url = "https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers-google.json"
+pattern = "prefixes.*.*"

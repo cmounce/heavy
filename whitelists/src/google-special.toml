@@ -1,0 +1,2 @@
+url = "https://developers.google.com/static/crawling/ipranges/special-crawlers.json"
+pattern = "prefixes.*.*"
