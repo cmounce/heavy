@@ -5,7 +5,9 @@ mod config;
 mod whitelist;
 
 use std::convert::Infallible;
+use std::env::args;
 use std::net::IpAddr;
+use std::process::exit;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,6 +46,19 @@ struct ChallengeConfig {
 
 #[tokio::main]
 async fn main() {
+    if let Some(arg) = args().skip(1).next() {
+        match arg.as_str() {
+            "-v" | "--version" => {
+                println!("Heavy {}", env!("CARGO_PKG_VERSION"));
+                exit(0);
+            }
+            _ => {
+                eprintln!("Unknown arg: {arg}");
+                exit(1);
+            }
+        }
+    }
+
     let config = config::load();
 
     // If access logging is enabled, open the log in append mode and spawn a dedicated writer task
