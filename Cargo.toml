@@ -21,3 +21,6 @@ arc-swap = "1.9.1"
 rand = "0.10.1"
 ipnet = "2.12.0"
 prefix-trie = { version = "0.8.2", features = ["ipnet"] }
+
+[dev-dependencies]
+insta = "1.47.2"

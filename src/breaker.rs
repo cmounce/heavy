@@ -81,26 +81,32 @@ impl CircuitBreaker {
                 if state.latency > config.trip_above {
                     let tripped_at = now;
 
-                    // The breaker tripped. Choose the length of the cooldown period.
-                    let cooldown_factor = if let Some(range) = prev_open {
+                    // Calculate base delay for exponential backoff
+                    let base_delay = if let Some(range) = prev_open {
+                        // If the breaker tripped immediately after reset, use the previous open
+                        // duration as the base delay. But if the breaker stayed closed for a while,
+                        // use a smaller value so the system gradually returns to normal.
                         let prev_open_secs = range.end.duration_since(range.start).as_secs_f64();
                         let secs_since_reset = tripped_at.duration_since(range.end).as_secs_f64();
-
-                        // Do exponential backoff with decay. If the breaker tripped immediately
-                        // after the last reset, double the cooldown period this time. But if the
-                        // breaker stayed closed for a while, use a smaller delay.
-                        let effective_old_delay = prev_open_secs
-                            * (0.5f64).powf(secs_since_reset / config.backoff_half_life);
-                        let new_delay = (2.0 * effective_old_delay)
-                            .clamp(config.min_open_duration, 7.0 * 24.0 * 60.0 * 60.0);
-                        new_delay / config.min_open_duration // express delay as a multiple of the configured base value
+                        let decay = (0.5f64).powf(secs_since_reset / config.backoff_half_life);
+                        config.min_open_duration
+                            + (prev_open_secs - config.min_open_duration) * decay
                     } else {
-                        1.0 // This is the first time the breaker tripped, so just use the base delay.
+                        // First time? Use config for the initial value.
+                        config.min_open_duration
                     };
-                    let jitter = rng.sample(Uniform::new(1.0, 1.5).unwrap());
+
+                    // Compute the new delay. Backoff only increases and is 1.5x on average.
+                    let jitter = rng.sample(Uniform::new(1.0, 2.0).unwrap());
+                    let new_delay = base_delay * jitter;
+                    let new_delay =
+                        new_delay.clamp(config.min_open_duration, 7.0 * 24.0 * 60.0 * 60.0);
+
+                    // Express the delay as a multiple of the configuration base value
+                    let cooldown_factor = new_delay / config.min_open_duration;
                     state.position = Position::OpenCooldown {
                         tripped_at,
-                        cooldown_factor: jitter * cooldown_factor,
+                        cooldown_factor,
                     };
                 }
             }
@@ -168,6 +174,7 @@ impl CircuitBreakerConfig {
 
 #[cfg(test)]
 mod tests {
+    use insta::assert_debug_snapshot;
     use rand::{SeedableRng, rngs::StdRng};
 
     use super::*;
@@ -218,6 +225,55 @@ mod tests {
             (average - expected).abs() < 1.0,
             "expected {expected} but got {average}"
         );
+    }
+
+    #[test]
+    fn test_exponential_backoff() {
+        let mut now = Instant::now();
+        let mut rng = StdRng::seed_from_u64(20260516);
+
+        // Each time the breaker trips under sustained load, resets, and immediately re-trips, the
+        // cooldown should roughly double (modulo jitter).
+        let breaker = CircuitBreaker::new(make_config(CircuitBreakerConfig::new(
+            1.0,         // trip when latency > 1 second
+            0.5,         // reset when latency < 0.5 seconds
+            10.0,        // average latency over ~10 requests
+            60.0,        // when breaker trips, stay open for at least a minute
+            1_000_000.0, // ignore backoff half life for now
+        )));
+
+        // Simulate sustained load until the breaker opens and closes 10 times
+        let mut open_durations = vec![];
+        while open_durations.len() < 10 {
+            // Immediately trip the breaker with high-latency requests
+            while !breaker.is_tripped() {
+                breaker.update_with(2.0, now, &mut rng);
+            }
+            let tripped_at = now;
+
+            // Simulate passing time and low-latency requests until the breaker resets
+            while breaker.is_tripped() {
+                now = now.add(Duration::from_millis(100));
+                breaker.update_with(0.0, now, &mut rng);
+            }
+            open_durations.push(now.duration_since(tripped_at).as_secs_f32().round() as u32);
+        }
+
+        // This should 1x-2x each time the breaker opens
+        assert_debug_snapshot!(open_durations, @"
+        [
+            63,
+            108,
+            179,
+            232,
+            304,
+            314,
+            607,
+            1132,
+            1525,
+            2731,
+        ]
+        ");
     }
 
     #[test]
