@@ -2,6 +2,7 @@ mod access_log;
 mod breaker;
 mod challenge;
 mod config;
+mod socket;
 mod whitelist;
 
 use std::convert::Infallible;
@@ -94,6 +95,9 @@ async fn main() {
     );
     if let Some(path) = &config.access_log {
         eprintln!("heavy: access logs enabled, writing to {path}")
+    }
+    if let Some(path) = config.socket_file.clone() {
+        tokio::spawn(socket::run_debug_socket(path));
     }
     if config.challenge_all {
         eprintln!("heavy: WARNING: challenge mode enabled for all requests");

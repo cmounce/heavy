@@ -14,6 +14,7 @@ pub struct Config {
     pub target: Uri,
     pub target_authority: hyper::http::uri::Authority,
     pub access_log: Option<String>,
+    pub socket_file: Option<String>,
     pub circuit_breaker: Arc<ArcSwap<CircuitBreakerConfig>>, // `ArcSwap` for future hot reloading
     pub challenge_all: bool,
     pub difficulty: u32,
@@ -31,6 +32,7 @@ struct FileConfig {
     bind: Option<String>,
     target: Option<String>,
     access_log: Option<String>,
+    socket_file: Option<String>,
     challenge_all: Option<bool>,
     difficulty: Option<u32>,
     token_secret: Option<String>,
@@ -127,6 +129,7 @@ pub fn load() -> Config {
         target,
         target_authority,
         access_log: env::var("ACCESS_LOG").ok().or(file.access_log),
+        socket_file: env::var("SOCKET_FILE").ok().or(file.socket_file),
         circuit_breaker: Arc::new(ArcSwap::new(Arc::new(breaker_config))),
         challenge_all: resolve!(challenge_all, "CHALLENGE_ALL", false),
         difficulty: resolve!(difficulty, "DIFFICULTY", 20),
