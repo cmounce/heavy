@@ -97,6 +97,7 @@ async fn main() {
         "heavy: listening on {}, proxying to {}",
         config.bind, config.target
     );
+    eprintln!("using data dir: {}", config.data_dir.display());
     if let Some(path) = &config.access_log {
         eprintln!("heavy: access logs enabled, writing to {path}")
     }
@@ -104,7 +105,7 @@ async fn main() {
         tokio::spawn(socket::run_debug_socket(path, recorder.clone()));
     }
     if config.challenge_all {
-        eprintln!("heavy: WARNING: challenge mode enabled for all requests");
+        eprintln!("WARNING: challenge mode enabled for all requests");
     }
 
     let challenge_config = ChallengeConfig {

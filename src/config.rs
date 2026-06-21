@@ -15,6 +15,8 @@ pub struct Config {
     pub target_authority: hyper::http::uri::Authority,
     pub access_log: Option<String>,
     pub socket_file: Option<String>,
+    /// Directory for Heavy's variable state (ML models, etc)
+    pub data_dir: PathBuf,
     pub circuit_breaker: Arc<ArcSwap<CircuitBreakerConfig>>, // `ArcSwap` for future hot reloading
     pub challenge_all: bool,
     pub difficulty: u32,
@@ -33,6 +35,7 @@ struct FileConfig {
     target: Option<String>,
     access_log: Option<String>,
     socket_file: Option<String>,
+    data_dir: Option<String>,
     challenge_all: Option<bool>,
     difficulty: Option<u32>,
     token_secret: Option<String>,
@@ -130,6 +133,11 @@ pub fn load() -> Config {
         target_authority,
         access_log: env::var("ACCESS_LOG").ok().or(file.access_log),
         socket_file: env::var("SOCKET_FILE").ok().or(file.socket_file),
+        data_dir: env::var("HEAVY_DATA_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .or(file.data_dir.map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/var/lib/heavy")),
         circuit_breaker: Arc::new(ArcSwap::new(Arc::new(breaker_config))),
         challenge_all: resolve!(challenge_all, "CHALLENGE_ALL", false),
         difficulty: resolve!(difficulty, "DIFFICULTY", 20),
