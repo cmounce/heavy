@@ -2,6 +2,7 @@ mod access_log;
 mod breaker;
 mod challenge;
 mod config;
+mod ml;
 mod socket;
 mod whitelist;
 
@@ -26,6 +27,8 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::access_log::AccessLog;
 use crate::breaker::CircuitBreaker;
+use crate::ml::features::RequestFeatures;
+use crate::ml::recorder::Recorder;
 use crate::whitelist::Whitelist;
 
 const WORKER_JS: &str = include_str!("../web/worker.js");
@@ -88,6 +91,7 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind to {}: {e}", config.bind));
 
     let breaker = Arc::new(CircuitBreaker::new(config.circuit_breaker.clone()));
+    let recorder = Arc::new(Recorder::new());
 
     eprintln!(
         "heavy: listening on {}, proxying to {}",
@@ -97,7 +101,7 @@ async fn main() {
         eprintln!("heavy: access logs enabled, writing to {path}")
     }
     if let Some(path) = config.socket_file.clone() {
-        tokio::spawn(socket::run_debug_socket(path));
+        tokio::spawn(socket::run_debug_socket(path, recorder.clone()));
     }
     if config.challenge_all {
         eprintln!("heavy: WARNING: challenge mode enabled for all requests");
@@ -127,6 +131,7 @@ async fn main() {
         let challenge_config = challenge_config.clone();
         let access_log = access_log.clone();
         let breaker = breaker.clone();
+        let recorder = recorder.clone();
         // IP of the directly-connected peer (usually the reverse proxy, not the end user)
         let peer_ip = addr.ip();
 
@@ -150,6 +155,7 @@ async fn main() {
                             target_authority.clone(),
                             access_log.clone(),
                             breaker.clone(),
+                            recorder.clone(),
                             challenge_config.clone(),
                             peer_ip,
                         )
@@ -169,10 +175,14 @@ async fn handle_request(
     target_authority: hyper::http::uri::Authority,
     access_log: Option<AccessLog>,
     breaker: Arc<CircuitBreaker>,
+    recorder: Arc<Recorder>,
     cc: ChallengeConfig,
     peer_ip: IpAddr,
 ) -> Result<Response<Either<Incoming, Full<Bytes>>>, Infallible> {
-    // Capture request metadata for logging before handing off the request
+    // Compute and record ML features right away
+    recorder.record(RequestFeatures::from_request(&req));
+
+    // Capture request metadata for access logging before handing off the request
     let method = req.method().to_string();
     let path = req
         .uri()

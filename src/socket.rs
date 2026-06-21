@@ -1,11 +1,14 @@
 use std::fs::symlink_metadata;
 use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-pub async fn run_debug_socket(path: String) {
+use crate::ml::recorder::Recorder;
+
+pub async fn run_debug_socket(path: String, recorder: Arc<Recorder>) {
     // Remove old socket file if left over from previous run
     let path = PathBuf::from(path);
     if let Ok(metadata) = symlink_metadata(&path) {
@@ -30,15 +33,16 @@ pub async fn run_debug_socket(path: String) {
                 continue;
             }
         };
+        let recorder = recorder.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_command(stream).await {
+            if let Err(e) = handle_command(stream, recorder).await {
                 eprintln!("debug socket client failed: {e}");
             }
         });
     }
 }
 
-async fn handle_command<S>(stream: S) -> std::io::Result<()>
+async fn handle_command<S>(stream: S, recorder: Arc<Recorder>) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -51,12 +55,28 @@ where
         }
 
         let command = line.trim();
-        let reply = match command {
-            "hello" | "hi" => "Hello, world!\n".into(),
-            "" => continue,
-            _ => format!("error: unknown command: {command}\n"),
-        };
-        stream.write_all(&reply.as_bytes()).await?;
+        let mut args = command.split_whitespace();
+        if let Some(verb) = args.next() {
+            let reply = match verb {
+                "hello" | "hi" => "Hello, world!\n".into(),
+                // Sample N requests as ML feature vectors. Blocks client until sample is complete.
+                "sample" => match args.next().and_then(|n| n.parse::<usize>().ok()) {
+                    Some(size) => match recorder.start_sample(size).await {
+                        Ok(sample) => {
+                            let mut out = format!("collected {} samples:\n", sample.len());
+                            for features in &sample {
+                                out.push_str(&format!("  {features:?}\n"));
+                            }
+                            out
+                        }
+                        Err(_) => "error: sample cancelled\n".into(),
+                    },
+                    None => "usage: sample <n>\n".into(),
+                },
+                _ => format!("error: unknown command: {command}\n"),
+            };
+            stream.write_all(&reply.as_bytes()).await?;
+        }
     }
 
     Ok(())
@@ -72,7 +92,7 @@ mod tests {
     #[tokio::test]
     async fn handles_line_commands() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(handle_command(server));
+        let task = tokio::spawn(handle_command(server, Arc::new(Recorder::new())));
 
         client.write_all(b"hello\n foo bar \n").await.unwrap();
         client.shutdown().await.unwrap();
