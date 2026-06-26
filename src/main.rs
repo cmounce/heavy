@@ -104,6 +104,7 @@ async fn main() {
     if let Some(path) = config.socket_file.clone() {
         tokio::spawn(socket::run_debug_socket(path, recorder.clone()));
     }
+    tokio::spawn(ml::train::run(config.data_dir.clone()));
     if config.challenge_all {
         eprintln!("WARNING: challenge mode enabled for all requests");
     }
