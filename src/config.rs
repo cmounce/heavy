@@ -15,7 +15,7 @@ pub struct Config {
     pub target_authority: hyper::http::uri::Authority,
     pub access_log: Option<String>,
     pub socket_file: Option<String>,
-    /// Directory for Heavy's variable state (ML models, etc)
+    /// Site-specific directory for Heavy's variable state (ML models, etc)
     pub data_dir: PathBuf,
     pub circuit_breaker: Arc<ArcSwap<CircuitBreakerConfig>>, // `ArcSwap` for future hot reloading
     pub challenge_all: bool,
@@ -35,6 +35,7 @@ struct FileConfig {
     target: Option<String>,
     access_log: Option<String>,
     socket_file: Option<String>,
+    site: Option<String>,
     data_dir: Option<String>,
     challenge_all: Option<bool>,
     difficulty: Option<u32>,
@@ -127,17 +128,22 @@ pub fn load() -> Config {
         WhitelistParams::default()
     };
 
+    // Figure out the site's data dir
+    let site = file.site.unwrap_or_else(|| "default".into());
+    // The slug for a site must be a valid folder name, but we can be a bit stricter than that.
+    // Restrict identifiers to ASCII strings that are vaguely hostname or domain-name shaped.
+    let site_regex = regex::Regex::new(r"^[A-Za-z0-9_]+(?:[.-][A-Za-z0-9_]+)*$").unwrap();
+    assert!(site_regex.is_match(&site), "invalid site ID string");
+    let data_dir =
+        PathBuf::from(resolve!(data_dir, "HEAVY_DATA_DIR", || "/var/lib/heavy".into())).join(site);
+
     Config {
         bind: resolve!(bind, "BIND", || "0.0.0.0:8011".into()),
         target,
         target_authority,
         access_log: env::var("ACCESS_LOG").ok().or(file.access_log),
         socket_file: env::var("SOCKET_FILE").ok().or(file.socket_file),
-        data_dir: env::var("HEAVY_DATA_DIR")
-            .ok()
-            .map(PathBuf::from)
-            .or(file.data_dir.map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("/var/lib/heavy")),
+        data_dir,
         circuit_breaker: Arc::new(ArcSwap::new(Arc::new(breaker_config))),
         challenge_all: resolve!(challenge_all, "CHALLENGE_ALL", false),
         difficulty: resolve!(difficulty, "DIFFICULTY", 20),
